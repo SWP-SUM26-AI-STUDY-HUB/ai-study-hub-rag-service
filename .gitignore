@@ -33,3 +33,6 @@ secrets.toml
 .chroma/
 *.db
 *.sqlite3
+
+# Local Parent Document Store
+parent_docs_store/
