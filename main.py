@@ -1,6 +1,4 @@
 import os
-import shutil
-import urllib.request
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -10,8 +8,10 @@ load_dotenv()
 
 from pydantic import BaseModel
 
-# Import the processing task from our RAG pipeline module
-from rag_pipeline import process_document_task, retrieve_documents
+# Import from the new modular structure
+from app.services.ingestion import process_document_task
+from app.services.retrieval import retrieve_documents
+from app.pipeline.dependencies import initialize_bm25
 
 class QueryRequest(BaseModel):
     query: str
@@ -22,13 +22,14 @@ class ProcessRequest(BaseModel):
 
 app = FastAPI(
     title="RAG Ingestion Pipeline", 
-    description="A simplified monolithic RAG ingestion pipeline using FastAPI's BackgroundTasks.",
+    description="A modular RAG ingestion pipeline using FastAPI.",
     version="1.0"
 )
 
-# Ensure temp directory exists for saving files locally before background processing
-TEMP_DIR = "temp"
-os.makedirs(TEMP_DIR, exist_ok=True)
+# Startup event to initialize BM25
+@app.on_event("startup")
+async def startup_event():
+    initialize_bm25()
 
 @app.post("/api/v1/rag/process")
 async def process_document(

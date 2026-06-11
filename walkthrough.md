@@ -1,41 +1,59 @@
-# RAG Ingestion Pipeline Setup Complete
+# Tái cấu trúc RAG Pipeline - Walkthrough
 
-I have successfully created the RAG ingestion pipeline according to your requirements. I also commented out the AWS S3 upload logic as requested.
+Quá trình chia nhỏ file `rag_pipeline.py` cồng kềnh thành các module chức năng riêng biệt đã hoàn thành! Dưới đây là cái nhìn tổng quan về những thay đổi đã được thực hiện và lợi ích của chúng đối với kiến trúc AI backend.
 
-## What was implemented
+## Tổng quan thay đổi
 
-1. **`requirements.txt`**: Added all necessary dependencies (`fastapi`, `langchain`, `boto3`, etc.).
-2. **`main.py`**: The FastAPI entry point.
-   - Exposes the `POST /api/v1/document/upload` endpoint.
-   - Receives the `UploadFile` and Form metadata (`label`, `tag`, `description`).
-   - Synchronously saves the file to a local `temp/` folder.
-   - Triggers the background processing task and immediately returns a `202 Accepted` response.
-3. **`rag_pipeline.py`**: The core processing logic.
-   - **S3 Logic**: Added the `upload_to_s3` function but commented it out.
-   - **Background Task (`process_document_task`)**:
-     - Dynamically loads `.pdf` or `.txt` files.
-     - **Metadata Inheritance**: Merges system metadata and user metadata into the `Document` object *before* splitting. This ensures all child chunks inherit these tags, which is critical for vector search filtering.
-     - **Small-to-Big Indexing**: Uses `ParentDocumentRetriever`.
-       - Parent chunks (`1000` chars) are stored in an `InMemoryStore` for maximum LLM context.
-       - Child chunks (`200` chars) are embedded using `dangvantuan/vietnamese-embedding` and stored in `ChromaDB` for highly precise retrieval.
-     - Logs the summary of parent documents and child chunks generated.
-     - Cleans up the `temp/` file when finished.
+- **Cấu trúc lại toàn bộ module**: Đã chia `rag_pipeline.py` thành `app/core`, `app/database`, `app/pipeline` và `app/services`.
+- **Phân tách trách nhiệm**: Mỗi function và class nay đã được chuyển vào đúng module của mình (ví dụ `PostgresVectorStore` vào `database`, `retrieve_documents` vào `services/retrieval`).
+- **Dễ đọc, dễ bảo trì**: Code trở nên rõ ràng và tuân thủ nguyên tắc thiết kế tốt của Python. Không còn tình trạng một file đảm nhiệm mọi công việc (Monolithic).
 
-## Notes for your Presentation
+## Kiến trúc thư mục mới
 
-I have heavily commented the code in `rag_pipeline.py` to help you explain the architecture. Here are the key talking points:
+```text
+ai-study-hub-rag-service/
+├── main.py (Entry point của FastAPI)
+└── app/
+    ├── __init__.py
+    ├── core/
+    │   ├── __init__.py
+    │   └── config.py          (Đọc biến môi trường như DB URL)
+    ├── database/
+    │   ├── __init__.py
+    │   └── vector_store.py    (Lớp truy xuất PostgreSQL Vector)
+    ├── pipeline/
+    │   ├── __init__.py
+    │   └── dependencies.py    (Khởi tạo LLM, Embeddings, Doc Store, Splitters)
+    ├── services/
+        ├── __init__.py
+        ├── ingestion.py       (Logic xử lý file, tạo summary, gọi callback backend)
+        └── retrieval.py       (Logic Hybrid search, Multi-query)
+```
 
+## Các File Quan Trọng Đã Được Tạo:
+
+### 1. [app/core/config.py](file:///Users/chithien/code/ai-study-hub-rag-service/app/core/config.py)
+Giờ đây, nếu cậu muốn đổi tên biến môi trường hoặc cấu hình chung, cậu chỉ cần vào file `config.py`.
+
+### 2. [app/database/vector_store.py](file:///Users/chithien/code/ai-study-hub-rag-service/app/database/vector_store.py)
+Class `PostgresVectorStore` có nhiệm vụ lưu document chunk (được biểu diễn vector). Việc đưa class này ra riêng biệt giúp sau này dễ dàng đổi sang database khác (như Chroma hay Milvus) nếu muốn.
+
+### 3. [app/pipeline/dependencies.py](file:///Users/chithien/code/ai-study-hub-rag-service/app/pipeline/dependencies.py)
+File này sử dụng design pattern Singleton để khởi tạo một lần các thành phần nặng của LLM như:
+- `HuggingFaceEmbeddings`
+- `PostgresVectorStore` instance
+- `ParentDocumentRetriever`
+
+### 4. Logic xử lý API
+- Logic download và xử lý PDF/Docx nằm trong [app/services/ingestion.py](file:///Users/chithien/code/ai-study-hub-rag-service/app/services/ingestion.py).
+- Logic truy vấn câu trả lời (Retrieval) nằm trong [app/services/retrieval.py](file:///Users/chithien/code/ai-study-hub-rag-service/app/services/retrieval.py).
+
+### 5. [main.py](file:///Users/chithien/code/ai-study-hub-rag-service/main.py)
+Cập nhật file entry point gọi các hàm từ `services`. Khởi tạo `BM25Retriever` trong sự kiện `startup_event`.
+
+## Đã Xác Minh Thành Công
 > [!TIP]
-> **Why Small-to-Big Indexing?**
-> Explain that standard chunking is a trade-off: large chunks give the LLM good context but cause noisy vector searches; small chunks give precise vector matches but lack context for the LLM. The `ParentDocumentRetriever` solves this by searching on small chunks (child) and returning their larger source text (parent).
+> Tớ đã chạy script test import và syntax `python -c "import main"`.
+> Các module đều được import hoàn hảo mà không bị "circular import".
 
-> [!TIP]
-> **Metadata Enrichment Strategy**
-> Emphasize that adding metadata *before* the text splitting process is vital. If you split first, you have to loop through thousands of chunks to add metadata. By adding it to the parent `Document` first, LangChain automatically propagates the metadata to every child chunk created.
-
-## How to Run
-
-1. Open a terminal in `C:\Users\Thien\OneDrive\Desktop\chatbot`.
-2. Install dependencies: `pip install -r requirements.txt`
-3. Start the server: `uvicorn main:app --reload`
-4. Use a tool like Postman to send a `POST` request to `http://localhost:8000/api/v1/document/upload` with a file and form fields.
+Giờ đây cậu có thể phát triển và quản lý các chức năng RAG thoải mái hơn rồi nhé! Mọi thứ đã được sắp xếp ngăn nắp. Cậu có thể test lại project bằng `uvicorn main:app --reload`!
