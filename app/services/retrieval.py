@@ -3,15 +3,17 @@ from langchain.retrievers import EnsembleRetriever
 from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import CrossEncoderReranker
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_community.document_compressors import JinaRerank
+import os
 from langchain_core.callbacks.manager import CallbackManagerForRetrieverRun
 
 from app.pipeline.dependencies import retriever, state
 
 logger = logging.getLogger(__name__)
 
-def retrieve_documents(query: str):
+from app.database.document_store import get_document_title
+from typing import List
+def retrieve_documents(query: str, document_ids: List[str] = None):
     """
     Executes the advanced retrieval phase combining Multi-Query generation
     and Hybrid Search (BM25 + Dense Parent/Child).
@@ -20,6 +22,15 @@ def retrieve_documents(query: str):
 
     if not bm25_retriever:
         raise ValueError("No documents have been indexed yet. BM25Retriever is empty.")
+
+    # Inject filter into ParentDocumentRetriever if document_ids is provided
+    # pgvector and langchain postgres support {"document_ids": [...]} or {"document_id": {"$in": [...]}}
+    # Temporarily assign to search_kwargs
+    if document_ids:
+        retriever.search_kwargs["filter"] = {"document_ids": document_ids}
+    else:
+        # Remove old filter if any
+        retriever.search_kwargs.pop("filter", None)
 
     # --- A. Hybrid Search (Ensemble Retriever) ---
     # Combine the sparse (keyword) and dense (semantic) retrievers.
@@ -40,10 +51,13 @@ def retrieve_documents(query: str):
     )
 
     # --- C. Cross-Encoder Re-ranking (Bottom of Funnel) ---
-    # We use AITeamVN/Vietnamese_Reranker to meticulously score the top documents.
-    # It will only return the top 5 most relevant documents.
-    cross_encoder_model = HuggingFaceCrossEncoder(model_name="AITeamVN/Vietnamese_Reranker")
-    compressor = CrossEncoderReranker(model=cross_encoder_model, top_n=5)
+    # We use Jina AI Reranker API to efficiently score the top documents without consuming local RAM.
+    # It will return the top 5 most relevant documents.
+    compressor = JinaRerank(
+        jina_api_key=os.environ.get("JINA_API_KEY"),
+        model="jina-reranker-v3",
+        top_n=5
+    )
     
     # Wrap the MultiQueryRetriever with the CompressionRetriever
     compression_retriever = ContextualCompressionRetriever(
@@ -67,9 +81,48 @@ def retrieve_documents(query: str):
 
     # Format output for the API response
     results = []
-    for d in retrieved_docs:
+    
+    # Post-filtering for BM25 Leakage mitigation
+    valid_retrieved_docs = []
+    if document_ids:
+        for d in retrieved_docs:
+            doc_id = d.metadata.get("document_id") or d.metadata.get("document_citation", "").split(",")[0].replace("Document ID: ", "").strip()
+            # Check data safety to prevent BM25 from returning other users' documents
+            if doc_id in document_ids:
+                valid_retrieved_docs.append(d)
+    else:
+        valid_retrieved_docs = retrieved_docs
+
+    title_cache = {}
+
+    for d in valid_retrieved_docs:
+        doc_citation = d.metadata.get("document_citation", f"File: {d.metadata.get('source_file', 'Unknown')}")
+        chunk_citation = d.metadata.get("chunk_citation", "")
+        
+        # Determine document ID to fetch title
+        doc_id = d.metadata.get("document_id")
+        if not doc_id and "Document ID: " in doc_citation:
+            doc_id = doc_citation.split(",")[0].replace("Document ID: ", "").strip()
+            
+        doc_title = "Unknown Title"
+        if doc_id:
+            if doc_id not in title_cache:
+                title_cache[doc_id] = get_document_title(doc_id)
+            doc_title = title_cache[doc_id]
+        
+        # Update metadata to explicitly include title
+        d.metadata["document_title"] = doc_title
+        
+        # Update the document_citation in metadata to include the title
+        updated_doc_citation = f"Title: {doc_title}, {doc_citation}"
+        d.metadata["document_citation"] = updated_doc_citation
+        
+        # Concatenate citation to prepend right above the returned content
+        combined_citation = f"[{updated_doc_citation}, {chunk_citation}]"
+        formatted_content = f"{combined_citation}\n{d.page_content}"
+        
         results.append({
-            "content": d.page_content,
+            "content": formatted_content,
             "metadata": d.metadata
         })
 

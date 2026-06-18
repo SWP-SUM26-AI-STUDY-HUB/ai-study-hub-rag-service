@@ -4,7 +4,7 @@ from typing import Optional
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain.storage import LocalFileStore
 from langchain.storage.encoder_backed import EncoderBackedStore
 from langchain.retrievers import ParentDocumentRetriever
@@ -16,7 +16,16 @@ from app.database.vector_store import PostgresVectorStore
 logger = logging.getLogger(__name__)
 
 # --- Embeddings & Vector Store ---
-embeddings = HuggingFaceEmbeddings(model_name="dangvantuan/vietnamese-embedding")
+class CustomGoogleEmbeddings(GoogleGenerativeAIEmbeddings):
+    def embed_documents(self, texts, **kwargs):
+        kwargs["output_dimensionality"] = 1536
+        return super().embed_documents(texts, **kwargs)
+        
+    def embed_query(self, text, **kwargs):
+        kwargs["output_dimensionality"] = 1536
+        return super().embed_query(text, **kwargs)
+
+embeddings = CustomGoogleEmbeddings(model="models/gemini-embedding-001")
 vectorstore = PostgresVectorStore(
     connection_string=settings.DATABASE_URL,
     embedding_function=embeddings

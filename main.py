@@ -11,7 +11,17 @@ from pydantic import BaseModel
 # Import from the new modular structure
 from app.services.ingestion import process_document_task
 from app.services.retrieval import retrieve_documents
+from app.services.router import route_chat_request
+from app.services.generation import generate_rag_response
 from app.pipeline.dependencies import initialize_bm25
+
+from typing import Optional
+from datetime import datetime, timezone
+
+class ChatRequest(BaseModel):
+    query: str
+    user_id: str
+    document_id: Optional[str] = None
 
 class QueryRequest(BaseModel):
     query: str
@@ -75,6 +85,62 @@ async def retrieve_chat(request: QueryRequest):
         return JSONResponse(status_code=400, content={"status": "error", "message": str(ve)})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": f"Retrieval failed: {str(e)}"})
+
+@app.post("/api/v1/chat")
+async def chat_router(request: ChatRequest):
+    """
+    Intelligent routing endpoint.
+    Uses LLM to route between:
+    - Summary fetch (if query asks for summary)
+    - Full RAG retrieval (if query asks about content)
+    """
+    try:
+        result = route_chat_request(request.query, request.user_id, request.document_id)
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        
+        if result.get("type") == "error":
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "message": result.get("message", "Error"),
+                    "data": {},
+                    "timestamp": timestamp
+                }
+            )
+        elif result.get("type") == "summary":
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "Summary retrieved successfully",
+                    "data": {
+                        "llm_response": result.get("content", ""),
+                        "debug": {}
+                    },
+                    "timestamp": timestamp
+                }
+            )
+        else: # type == "qa"
+            retrieval_data = result.get("retrieval_data", {})
+            documents = retrieval_data.get("documents", [])
+            llm_answer = generate_rag_response(request.query, documents)
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "Answer generated successfully",
+                    "data": {
+                        "llm_response": llm_answer,
+                        "debug": retrieval_data
+                    },
+                    "timestamp": timestamp
+                }
+            )
+            
+    except Exception as e:
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return JSONResponse(status_code=500, content={"success": False, "message": f"Router failed: {str(e)}", "data": {}, "timestamp": timestamp})
 
 if __name__ == "__main__":
     import uvicorn

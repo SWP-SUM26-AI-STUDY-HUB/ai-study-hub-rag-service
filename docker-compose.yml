@@ -1,0 +1,20 @@
+version: '3.8'
+
+networks:
+  ai-study-hub-network:
+    external: true
+
+services:
+  rag-service:
+    build: .
+    container_name: ai-study-hub-rag-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./parent_docs_store:/app/parent_docs_store
+      - ./temp:/app/temp
+    networks:
+      - ai-study-hub-network

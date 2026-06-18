@@ -1,0 +1,50 @@
+name: Deploy Python FastAPI app to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            if [ ! -d "$HOME/ai-study-hub-rag-service/.git" ]; then
+              echo "directory not exist, clone code..."
+              rm -rf ~/ai-study-hub-rag-service
+            fi
+            
+            mkdir -p ~/ai-study-hub-rag-service
+            cd ~/ai-study-hub-rag-service
+
+            if [ -d ".git" ]; then
+              echo "directory exist, pull code..."
+              git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+              git fetch --all
+              git reset --hard origin/main
+            else
+              echo "directory not exist, clone code..."
+              git clone -b main https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git .
+            fi
+
+            # Optionally, create or update the .env file from secrets if needed
+            # echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > .env
+            
+            # Create external docker network if it doesn't exist
+            docker network inspect ai-study-hub-network >/dev/null 2>&1 || docker network create ai-study-hub-network
+
+            echo "restarting Docker containers..."
+            docker compose down
+            docker compose up --build -d

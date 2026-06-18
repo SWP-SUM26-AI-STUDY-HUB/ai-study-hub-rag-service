@@ -45,7 +45,7 @@ def generate_document_summary(docs: List[Document]) -> str:
         return response.content
     except Exception as e:
         logger.error(f"Failed to generate summary: {e}")
-        return "Tài liệu đã được tải lên thành công, tuy nhiên việc tự động tạo tóm tắt gặp sự cố."
+        return "The document was uploaded successfully, but an error occurred while generating the summary."
 
 def send_callback(document_id: str, status: str, summary: str = "", max_retries: int = 3):
     callback_url = settings.BACKEND_CALLBACK_URL
@@ -124,6 +124,14 @@ def process_document_task(file_url: str, filename: str, metadata_input: dict):
         }
         
         for doc in docs:
+            # Get page info if available (PyPDFLoader usually stores 'page' starting from 0)
+            page_num = doc.metadata.get("page", 0) + 1
+            
+            # Document-level citation
+            doc.metadata["document_citation"] = f"Document ID: {document_id}, File: {filename}"
+            # Chunk/Page-level citation
+            doc.metadata["chunk_citation"] = f"Page: {page_num}"
+            
             doc.metadata.update(system_metadata)
             doc.metadata.update(metadata_input)
 

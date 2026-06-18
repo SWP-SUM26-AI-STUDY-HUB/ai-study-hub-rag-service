@@ -14,9 +14,7 @@ chromadb>=0.5.0
 psycopg2-binary>=2.9.0
 
 # --- Embeddings & LLM Models ---
-langchain-huggingface>=0.0.3
-sentence-transformers>=2.6.0
-huggingface_hub>=0.22.0
+# Removed local huggingface libraries to save RAM
 
 # --- Document Loaders & Utilities ---
 pypdf>=4.1.0

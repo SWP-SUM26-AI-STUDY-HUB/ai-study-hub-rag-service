@@ -96,12 +96,12 @@ class PostgresVectorStore(VectorStore):
                     if "document_ids" in filter:
                         doc_ids = filter["document_ids"]
                         if doc_ids:
-                            filter_clause = "AND document_id = ANY(%s)"
+                            filter_clause = "AND document_id = ANY(%s::uuid[])"
                             params.append(doc_ids)
                     elif "document_id" in filter:
                         doc_id = filter["document_id"]
                         if doc_id:
-                            filter_clause = "AND document_id = %s"
+                            filter_clause = "AND document_id = %s::uuid"
                             params.append(doc_id)
                 
                 sql = f"""
