@@ -1,4 +1,5 @@
 import os
+import logging
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -37,10 +38,51 @@ app = FastAPI(
     version="1.0"
 )
 
-# Startup event to initialize BM25
+# Startup event: initialize BM25 + warm up external API clients.
 @app.on_event("startup")
 async def startup_event():
     initialize_bm25()
+    _warmup_clients()
+
+
+def _warmup_clients(timeout_s: float = 20.0):
+    """Đàm (warm up) client LLM + embedding ngay lúc startup.
+
+    Request đầu sau mỗi lần khởi động từng chịu cold-start ~14s ở Gemini (TLS +
+    OAuth token + SDK init, có thể kèm retry). Warmup đẩy chi phí đó về startup
+    thay vì lên request đầu của user. Chạy trong thread kèm timeout để không block
+    startup vô hạn; lỗi warmup không làm sập server.
+    """
+    import threading
+
+    from app.core.clients import llm
+    from app.pipeline.dependencies import embeddings
+
+    warmup_logger = logging.getLogger("warmup")
+    result = {"ok": False}
+
+    def _do():
+        try:
+            llm.invoke("hi")
+            embeddings.embed_query("warmup")
+            result["ok"] = True
+        except Exception as e:  # noqa: BLE001
+            result["err"] = str(e)
+
+    warmup_logger.info("Warming up LLM + embeddings clients...")
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        warmup_logger.warning(
+            "Warmup chưa xong sau %.0fs — request đầu có thể chậm.", timeout_s
+        )
+    elif result.get("ok"):
+        warmup_logger.info("Warmup complete.")
+    else:
+        warmup_logger.warning(
+            "Warmup failed (%s) — sẽ warm lười ở request đầu.", result.get("err")
+        )
 
 @app.post("/api/v1/rag/process")
 async def process_document(
