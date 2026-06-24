@@ -14,6 +14,7 @@ from app.services.retrieval import retrieve_documents
 from app.services.router import route_chat_request
 from app.services.generation import generate_rag_response
 from app.pipeline.dependencies import initialize_bm25
+from app.core.performance import start_trace
 
 from typing import Optional
 from datetime import datetime, timezone
@@ -72,32 +73,39 @@ async def process_document(
     )
 
 @app.post("/api/v1/chat/retrieve")
-async def retrieve_chat(request: QueryRequest):
+def retrieve_chat(request: QueryRequest):
     """
     Endpoint to retrieve relevant documents using Hybrid Search (BM25 + Dense)
     and Multi-Query generation.
     """
+    # S3: sync `def` handler -> FastAPI chạy trong threadpool, không chặn event loop.
+    trace = start_trace("retrieve", query=request.query)
     try:
         result = retrieve_documents(request.query)
+        result["timing"] = trace.as_dict()
         return JSONResponse(content=result, status_code=200)
     except ValueError as ve:
         # E.g., when BM25 is empty because no docs are indexed yet
         return JSONResponse(status_code=400, content={"status": "error", "message": str(ve)})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": f"Retrieval failed: {str(e)}"})
+    finally:
+        trace.emit(query=request.query)
 
 @app.post("/api/v1/chat")
-async def chat_router(request: ChatRequest):
+def chat_router(request: ChatRequest):
     """
     Intelligent routing endpoint.
     Uses LLM to route between:
     - Summary fetch (if query asks for summary)
     - Full RAG retrieval (if query asks about content)
     """
+    # S3: sync `def` handler -> FastAPI chạy trong threadpool, không chặn event loop.
+    trace = start_trace("chat", user_id=request.user_id, document_id=request.document_id)
     try:
         result = route_chat_request(request.query, request.user_id, request.document_id)
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        
+
         if result.get("type") == "error":
             return JSONResponse(
                 status_code=400,
@@ -116,12 +124,12 @@ async def chat_router(request: ChatRequest):
                     "message": "Summary retrieved successfully",
                     "data": {
                         "llm_response": result.get("content", ""),
-                        "debug": {}
+                        "debug": {"timing": trace.as_dict()}
                     },
                     "timestamp": timestamp
                 }
             )
-        else: # type == "qa"
+        else:  # type == "qa"
             retrieval_data = result.get("retrieval_data", {})
             documents = retrieval_data.get("documents", [])
             llm_answer = generate_rag_response(request.query, documents)
@@ -132,15 +140,17 @@ async def chat_router(request: ChatRequest):
                     "message": "Answer generated successfully",
                     "data": {
                         "llm_response": llm_answer,
-                        "debug": retrieval_data
+                        "debug": {**retrieval_data, "timing": trace.as_dict()},
                     },
                     "timestamp": timestamp
                 }
             )
-            
+
     except Exception as e:
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         return JSONResponse(status_code=500, content={"success": False, "message": f"Router failed: {str(e)}", "data": {}, "timestamp": timestamp})
+    finally:
+        trace.emit(query=request.query)
 
 if __name__ == "__main__":
     import uvicorn

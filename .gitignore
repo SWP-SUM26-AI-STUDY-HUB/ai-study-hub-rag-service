@@ -36,3 +36,6 @@ secrets.toml
 
 # Local Parent Document Store
 parent_docs_store/
+
+# Performance logs
+logs/

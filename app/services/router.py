@@ -1,6 +1,7 @@
 import logging
 from typing import Optional
-from langchain_google_genai import ChatGoogleGenerativeAI
+from app.core.clients import llm
+from app.core.performance import stage
 from langchain_core.prompts import PromptTemplate
 
 from app.services.retrieval import retrieve_documents
@@ -20,7 +21,8 @@ def route_chat_request(query: str, user_id: str, document_id: Optional[str] = No
         document_ids = [document_id]
     else:
         # If QA is intended for all user documents
-        document_ids = get_user_document_ids(user_id)
+        with stage("user_doc_ids"):
+            document_ids = get_user_document_ids(user_id)
         if not document_ids:
             return {
                 "type": "error",
@@ -39,15 +41,15 @@ def route_chat_request(query: str, user_id: str, document_id: Optional[str] = No
         "{system_instruction}\n\nQuestion: {query}"
     )
 
-    # 2. Use LLM for classification
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+    # 2. Use LLM for classification (S2: shared singleton)
     chain = prompt | llm
-    
+
     try:
-        response = chain.invoke({
-            "system_instruction": system_instruction,
-            "query": query
-        })
+        with stage("router_llm"):
+            response = chain.invoke({
+                "system_instruction": system_instruction,
+                "query": query
+            })
         decision = response.content.strip().upper()
     except Exception as e:
         logger.error(f"Error during LLM routing: {e}")
@@ -63,7 +65,8 @@ def route_chat_request(query: str, user_id: str, document_id: Optional[str] = No
                 "type": "error",
                 "message": "To get a summary, please select a specific document (provide document_id)."
             }
-        summary_text = get_document_summary(document_id)
+        with stage("document_summary_fetch"):
+            summary_text = get_document_summary(document_id)
         return {
             "type": "summary",
             "content": summary_text

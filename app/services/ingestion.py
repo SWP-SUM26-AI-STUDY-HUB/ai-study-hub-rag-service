@@ -9,7 +9,7 @@ from typing import List
 
 from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
-from langchain_google_genai import ChatGoogleGenerativeAI
+from app.core.clients import llm
 
 from app.core.config import settings
 from app.pipeline.dependencies import retriever, vectorstore, store, update_bm25
@@ -30,7 +30,6 @@ def generate_document_summary(docs: List[Document]) -> str:
         if not full_text.strip():
             return "No content available to summarize."
 
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
         prompt = (
             "You are a professional study assistant.\n"
             "First, analyze the document content below to identify its primary language.\n"

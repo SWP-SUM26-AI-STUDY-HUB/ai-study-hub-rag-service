@@ -1,6 +1,7 @@
 import logging
 from typing import List, Dict
-from langchain_google_genai import ChatGoogleGenerativeAI
+from app.core.clients import llm
+from app.core.performance import stage
 from langchain_core.prompts import PromptTemplate
 
 logger = logging.getLogger(__name__)
@@ -42,17 +43,15 @@ Answer:"""
 
         prompt = PromptTemplate.from_template(system_template)
         
-        # Initialize LLM
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
-        
-        # Create chain and invoke
+        # S2: shared singleton LLM
         chain = prompt | llm
-        
+
         logger.info(f"Generating RAG response for query: {query}")
-        response = chain.invoke({
-            "context": context_text,
-            "query": query
-        })
+        with stage("generation"):
+            response = chain.invoke({
+                "context": context_text,
+                "query": query
+            })
         
         return response.content.strip()
 
