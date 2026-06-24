@@ -16,5 +16,6 @@ services:
     volumes:
       - ./parent_docs_store:/app/parent_docs_store
       - ./temp:/app/temp
+      - ./logs:/app/logs
     networks:
       - ai-study-hub-network
