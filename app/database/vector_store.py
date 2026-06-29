@@ -71,6 +71,122 @@ class PostgresVectorStore(VectorStore):
                 )
                 conn.commit()
         return ids
+    # ----------------------------------------------------------------------
+    # Two-phase extract/index support for public documents (moderation gate).
+    # Extract inserts child chunks with embedding = NULL (not retrievable).
+    # Index embeds those NULL rows; only embedded chunks are ever returned.
+    # ----------------------------------------------------------------------
+
+    def add_texts_without_embedding(self, documents: List["Document"]) -> int:
+        """Extract phase: insert child chunks with embedding = NULL.
+
+        Children already carry metadata[doc_id] = parent uuid (set by
+        ParentDocumentRetriever._split_docs_for_adding) plus document_id and
+        citation metadata, so parent-fetch retrieval keeps working once the
+        chunks are later embedded by ``embed_pending_chunks``.
+        """
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                rows = []
+                for i, doc in enumerate(documents):
+                    metadata = doc.metadata or {}
+                    doc_id = metadata.get("document_id")
+                    page_number = metadata.get("page") or metadata.get("page_number")
+                    if page_number is not None:
+                        try:
+                            page_number = int(page_number)
+                        except (ValueError, TypeError):
+                            page_number = None
+                    chunk_index = metadata.get("chunk_index", i)
+                    rows.append((
+                        str(uuid.uuid4()),
+                        doc_id,
+                        chunk_index,
+                        doc.page_content,
+                        json.dumps(metadata),
+                        page_number,
+                    ))
+                if rows:
+                    execute_values(
+                        cur,
+                        f"""
+                        INSERT INTO {self.table_name}
+                            (id, document_id, chunk_index, content, embedding, metadata, page_number)
+                        VALUES %s
+                        """,
+                        rows,
+                    )
+                    conn.commit()
+        return len(rows)
+
+    def embed_pending_chunks(self, document_id: str) -> int:
+        """Index phase: embed child chunks whose embedding is still NULL for a document.
+
+        Single ``embed_documents`` round-trip over all pending chunks of the
+        document, then per-row UPDATE. Returns the number of chunks embedded.
+        """
+        with stage("embed_documents"), db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT id, content FROM {self.table_name} "
+                    f"WHERE document_id = %s AND embedding IS NULL",
+                    (document_id,),
+                )
+                pending = cur.fetchall()
+                if not pending:
+                    return 0
+                contents = [row[1] for row in pending]
+                embeddings = self.embedding_function.embed_documents(contents)
+                for (chunk_id, _content), emb in zip(pending, embeddings):
+                    emb_str = "[" + ",".join(map(str, emb)) + "]"
+                    cur.execute(
+                        f"UPDATE {self.table_name} SET embedding = %s WHERE id = %s",
+                        (emb_str, chunk_id),
+                    )
+                conn.commit()
+                return len(pending)
+
+    def delete_by_document_id(self, document_id: str):
+        """Delete every chunk of a document. Returns (chunks_deleted, parent_ids).
+
+        ``parent_ids`` are the distinct ``metadata.doc_id`` values so the caller
+        can also purge the matching parent docs from the docstore.
+        """
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT DISTINCT metadata->>'doc_id' FROM {self.table_name} "
+                    f"WHERE document_id = %s AND metadata->>'doc_id' IS NOT NULL",
+                    (document_id,),
+                )
+                parent_ids = list({row[0] for row in cur.fetchall()})
+                cur.execute(
+                    f"DELETE FROM {self.table_name} WHERE document_id = %s",
+                    (document_id,),
+                )
+                count = cur.rowcount
+                conn.commit()
+                return count, parent_ids
+
+    def update_chunk_visibility(self, document_id: str, visibility: str) -> int:
+        """Stamp a visibility flag into chunk metadata jsonb for a document.
+
+        Forward-looking: lets retrieval filter by visibility if needed later.
+        Today Java gates which document_ids reach RAG chat, so this is metadata
+        only. Returns the number of chunks updated.
+        """
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {self.table_name} "
+                    f"SET metadata = COALESCE(metadata, '{{}}'::jsonb) "
+                    f"|| jsonb_build_object('visibility', %s::text) "
+                    f"WHERE document_id = %s",
+                    (visibility, document_id),
+                )
+                updated = cur.rowcount
+                conn.commit()
+                return updated
 
     def similarity_search_by_vector(
         self,
@@ -104,7 +220,9 @@ class PostgresVectorStore(VectorStore):
                 sql = f"""
                 SELECT content, metadata, page_number, (embedding <=> %s) AS distance
                 FROM {self.table_name}
-                WHERE 1=1 {filter_clause}
+                -- embedding IS NOT NULL: never surface extracted-but-not-indexed chunks
+                -- (public docs awaiting moderation are extracted with NULL embeddings).
+                WHERE embedding IS NOT NULL {filter_clause}
                 ORDER BY embedding <=> %s
                 LIMIT %s
                 """

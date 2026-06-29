@@ -10,7 +10,13 @@ load_dotenv()
 from pydantic import BaseModel
 
 # Import from the new modular structure
-from app.services.ingestion import process_document_task
+from app.services.ingestion import (
+    process_document_task,
+    extract_document_task,
+    index_document_task,
+    delete_document,
+    update_document_visibility,
+)
 from app.services.retrieval import retrieve_documents
 from app.services.router import route_chat_request
 from app.services.generation import generate_rag_response
@@ -31,6 +37,12 @@ class QueryRequest(BaseModel):
 class ProcessRequest(BaseModel):
     document_id: str
     file_url: str
+
+class IndexRequest(BaseModel):
+    document_id: str
+
+class VisibilityRequest(BaseModel):
+    visibility: str
 
 app = FastAPI(
     title="RAG Ingestion Pipeline", 
@@ -113,6 +125,55 @@ async def process_document(
         },
         status_code=202
     )
+
+def _filename_from_url(file_url: str, document_id: str) -> str:
+    from urllib.parse import urlparse
+    filename = os.path.basename(urlparse(file_url).path)
+    return filename or f"{document_id}.pdf"
+
+
+@app.post("/api/v1/rag/extract")
+async def extract_document(request: ProcessRequest, background_tasks: BackgroundTasks):
+    """PUBLIC documents: extract only (NULL-embedding chunks) for moderation.
+
+    Chunks become available at GET /api/v1/rag/documents/{id}/chunks. Indexing
+    is deferred to /api/v1/rag/index until the document is approved. Sends an
+    EXTRACTED callback (summary included); backend status stays PENDING.
+    """
+    filename = _filename_from_url(request.file_url, request.document_id)
+    metadata = {"document_id": request.document_id}
+    background_tasks.add_task(extract_document_task, request.file_url, filename, metadata)
+    return JSONResponse(
+        content={
+            "status": "accepted",
+            "message": "Extraction started; chunks will be available for moderation",
+        },
+        status_code=202,
+    )
+
+
+@app.post("/api/v1/rag/index")
+def index_document(request: IndexRequest, background_tasks: BackgroundTasks):
+    """Approved public document: embed pending chunks + rebuild BM25 (background)."""
+    background_tasks.add_task(index_document_task, request.document_id)
+    return JSONResponse(
+        content={"status": "accepted", "message": "Indexing started in background"},
+        status_code=202,
+    )
+
+
+@app.patch("/api/v1/rag/documents/{document_id}/visibility")
+def patch_visibility(document_id: str, request: VisibilityRequest):
+    """Stamp a visibility flag into chunk metadata (metadata only)."""
+    result = update_document_visibility(document_id, request.visibility)
+    return JSONResponse(content=result, status_code=200)
+
+
+@app.delete("/api/v1/rag/documents/{document_id}")
+def delete_document_endpoint(document_id: str):
+    """Delete every chunk + parent doc for a document (reject / delete flows)."""
+    result = delete_document(document_id)
+    return JSONResponse(content=result, status_code=200)
 
 @app.post("/api/v1/chat/retrieve")
 def retrieve_chat(request: QueryRequest):
