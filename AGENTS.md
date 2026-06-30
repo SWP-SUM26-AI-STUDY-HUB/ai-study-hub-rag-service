@@ -14,14 +14,14 @@ Single FastAPI app (`main.py`) exposing REST endpoints. There is no DB ORM layer
 Java backend ──HTTP──▶ FastAPI (main.py)
                           │
    ingest endpoints       │           chat endpoints
-   POST /rag/process      │           POST /chat  ─▶ router (LLM: SUMMARY vs QA)
+   POST /chat  ─▶ router (deterministic: SMALLTALK → SUMMARY → QA)
    POST /rag/extract      │                              │
    POST /rag/index        │              QA branch: retrieve_documents()
    PATCH /rag/.../visibility│              ├─ BM25 (parent docs, filtered by document_id)
    DELETE /rag/documents/{id}│             ├─ dense pgvector cosine (HNSW, k=25)
                           │              ├─ EnsembleRetriever (BM25 0.3 / dense 0.7)
    ◀── callback (X-Internal-Secret) ─     ├─ Jina re-rank → top context
-        send_callback() ──▶ backend       └─ Gemini generation → [N] citations
+        send_callback() ──▶ backend       └─ Gemini generation (+ conversation history) → [N] citations
 ```
 
 **Ingestion is two-phase** (`app/services/ingestion.py`):
@@ -47,9 +47,9 @@ app/
 │   └── document_store.py   document lookups (summary, title, user document ids)
 ├── services/
 │   ├── ingestion.py        _extract / _index / process / extract / index tasks + delete + visibility
-│   ├── retrieval.py        Hybrid retrieval: BM25 + dense (EnsembleRetriever) + Jina re-rank
-│   ├── router.py           LLM router: SUMMARY vs QA branch
-│   └── generation.py       Gemini RAG answer with [N] citation markers
+│   ├── retrieval.py        Hybrid retrieval (BM25+dense) + Jina re-rank; optional follow-up query-rewrite
+│   ├── router.py           Deterministic router (regex): SMALLTALK / SUMMARY / QA — no LLM
+│   └── generation.py       Gemini RAG answer with [N] citations; consumes history (multi-turn)
 └── pipeline/
     └── dependencies.py     Singletons: embeddings, vectorstore, parent/child splitters,
                             ParentDocumentRetriever, LocalFileStore docstore, BM25 state (initialize/update_bm25)
@@ -101,15 +101,21 @@ docker compose up --build -d
 
 **Callbacks to backend.** `send_callback` uses stdlib `urllib.request` (not `requests`/`httpx`) with the `X-Internal-Secret` header; 3 retries, exponential backoff.
 
+**Intent routing (deterministic, no LLM).** `route_chat_request()` classifies each `/chat` query by regex into SMALLTALK (greetings/thanks/farewell) → SUMMARY (explicit summary request on a selected `document_id`) → QA (default). The router makes **no LLM call** — a 3-way intent split is trivially rule-based; an LLM here only added latency + a quota increment per request. `document_id == null` is always QA (SUMMARY needs a specific doc). Misses are safe: a paraphrased summary request with no keyword falls through to QA, which still answers over the selected doc.
+
+**Multi-turn memory.** The backend sends the session's prior turns as `history` (`{role, content}`, oldest first, capped at 10) in the `/chat` body. `generate_rag_response()` injects them as a "Conversation so far" block so the model can resolve follow-up references (pronouns, "that", "as you mentioned"). History is **auxiliary only** — the answer must still be grounded in the retrieved context and cite `[N]` from it, never from history. For context-dependent follow-ups (e.g. "hãy trả lời nội dung đó"), `ENABLE_QUERY_REWRITE=1` rewrites the query into a self-contained one (1 LLM call) and feeds it to retrieval + rerank **only** — the generator still receives the original query (option b). Default OFF; triggered only when the query looks like a follow-up (pronouns/deictics) and history is present.
+
+**Empty-retrieval guard.** When the QA branch retrieves zero relevant chunks, `chat_router` short-circuits with a fixed "no information" message instead of calling the generator on an empty context (avoids hallucination + saves a generation call).
+
 ## Important Files
 
 | File | Purpose |
 |------|---------|
-| `main.py` | FastAPI app: all endpoints (`/rag/process`, `/rag/extract`, `/rag/index`, `/rag/documents/{id}/visibility`, `/rag/documents/{id}`, `/chat`, `/chat/retrieve`), request models, startup (BM25 init + client warmup) |
+| `main.py` | FastAPI app: endpoints (`/rag/process`, `/rag/extract`, `/rag/index`, `/rag/documents/{id}/visibility`, `/rag/documents/{id}`, `/chat`), request models (`ChatRequest` carries `history` for multi-turn memory), startup (BM25 init + client warmup). The old `/chat/retrieve` debug endpoint was removed (it searched the whole store unfiltered). |
 | `app/services/ingestion.py` | Two-phase `_extract`/`_index` + `process/extract/index_document_task`, `delete_document`, `update_document_visibility`, `send_callback`, `generate_document_summary` |
-| `app/services/retrieval.py` | `retrieve_documents()` — hybrid BM25+dense (`EnsembleRetriever`) + Jina rerank; BM25 pre-filtered by `document_id` |
-| `app/services/router.py` | `route_chat_request()` — LLM classifies SUMMARY vs QA |
-| `app/services/generation.py` | `generate_rag_response()` — Gemini answer with `[N]` citation markers |
+| `app/services/retrieval.py` | `retrieve_documents(query, document_ids, history=None)` — hybrid BM25+dense (`EnsembleRetriever`) + Jina rerank; BM25 pre-filtered by `document_id`; optional follow-up query-rewrite (`ENABLE_QUERY_REWRITE` — retrieval/rerank only, generator keeps the original query) |
+| `app/services/router.py` | `route_chat_request()` — deterministic regex router: SMALLTALK → SUMMARY (needs `document_id`) → QA (default); **no LLM**. Returns `smalltalk` / `summary` / `qa` / `error` |
+| `app/services/generation.py` | `generate_rag_response(query, documents, history=None)` — Gemini answer with `[N]` citation markers; injects prior turns (`history`) to resolve follow-up references |
 | `app/database/vector_store.py` | Custom `PostgresVectorStore`: `add_texts` (embed), `add_texts_without_embedding` (extract), `embed_pending_chunks` (index), `delete_by_document_id`, `update_chunk_visibility`, `similarity_search_by_vector` (`embedding IS NOT NULL`) |
 | `app/pipeline/dependencies.py` | Pipeline singletons: `embeddings` (Gemini 1536-dim), `vectorstore`, `store` (LocalFileStore), `retriever` (ParentDocumentRetriever), splitters, BM25 `state` + `initialize_bm25`/`update_bm25` |
 | `app/database/pool.py` | `ThreadedConnectionPool` + `db_connection()` context manager |
@@ -126,13 +132,15 @@ docker compose up --build -d
 The Java backend (`~/code/ai-study-hub-api`, Spring Boot 4.0.6) is the API gateway and owns `documents`/`users`/`chat_sessions`/etc. This RAG service **owns `document_chunks`** (writes embeddings + metadata). The two share one PostgreSQL `aistudyhub` DB and one `INTERNAL_API_SECRET`.
 
 **Contract (this service's side):**
-- Receives `POST /api/v1/rag/process` (private: extract+index), `/extract` (public: extract only), `/index` (after approval: embed pending), `PATCH /rag/documents/{id}/visibility`, `DELETE /rag/documents/{id}`, `POST /api/v1/chat`, `/chat/retrieve` — all from the backend over the shared network.
+- Receives `POST /api/v1/rag/process` (private: extract+index), `/extract` (public: extract only), `/index` (after approval: embed pending), `PATCH /rag/documents/{id}/visibility`, `DELETE /rag/documents/{id}`, `POST /api/v1/chat` — all from the backend over the shared network. (The old `/chat/retrieve` debug endpoint was removed.)
+- `/chat` body: `{query, user_id, document_id, history}` — `history` is the session's prior turns (`{role, content}`, oldest first, ≤10) for multi-turn memory. Response shape is unchanged (`data.llm_response` + `data.debug`); the router internally picks SMALLTALK (canned reply) / SUMMARY (precomputed) / QA (retrieval + generation, with an empty-retrieval guard).
 - Sends `POST` to `${BACKEND_CALLBACK_URL}` (= backend `/api/v1/internal/documents/callback`) with `X-Internal-Secret: ${INTERNAL_API_SECRET}`, body `{document_id, status: SUCCESS|EXTRACTED|FAILED, summary}`.
 
 **Gotchas:**
 - `INTERNAL_API_SECRET` here must equal the backend's `app.internal.secret`, else every callback is rejected with 403.
 - **The backend reads `document_chunks` read-only** (its `DocumentChunkRepository`) for moderation — it never writes this table. Only this service writes `document_chunks`.
 - The backend gates which `document_id`s reach `/chat` (only `COMPLETED` docs), so this service does not need to filter retrieval by document status — but it does filter `embedding IS NOT NULL` as a safety net.
+- **Smalltalk/greetings** (detected in this service's router) return a canned reply with no retrieval and no citations — but the backend still counts them against the daily AI quota, because it increments the counter *before* calling RAG. If chitchat should be free, the backend must detect it itself.
 - See the backend's `AGENTS.md` for the full document lifecycle / moderation flow.
 
 ## Runtime / Tooling Preferences
@@ -142,7 +150,7 @@ The Java backend (`~/code/ai-study-hub-api`, Spring Boot 4.0.6) is the API gatew
 - **Dependencies**: `pip install -r requirements.txt`. **LangChain is pinned to 0.3.x — do not bump to 1.x** (it removed `langchain.storage`, reshuffled `langchain.retrievers`, etc.; this code targets the 0.3 API). ChromaDB is intentionally **not** used — vectors live in pgvector via the custom `PostgresVectorStore`.
 - **Container**: `docker-compose.yml` builds `.` and joins the **external** `ai-study-hub-network` (created by the backend's compose). Mounts `parent_docs_store/`, `temp/`, `logs/` so parent docs and logs survive restarts.
 - **External APIs**: Google Gemini (LLM `gemini-2.5-flash-lite`, embeddings `gemini-embedding-001` forced to **1536 dims**) + Jina (`jina-reranker-v3`). Keys via env (`GOOGLE_API_KEY` consumed by langchain-google-genai, `JINA_API_KEY`).
-- **Env vars** (`.env`, loaded by `dotenv`): `DATABASE_URL`, `BACKEND_CALLBACK_URL`, `INTERNAL_API_SECRET`, `GOOGLE_API_KEY`, `JINA_API_KEY`, `ENABLE_MULTI_QUERY` (default `0` — multi-query costs ~6s/extra LLM call), `DB_POOL_MAX` (default 20), `ENABLE_PERF_LOG` (default `1`), `TEMP_DIR` (default `temp`). Never commit `.env`.
+- **Env vars** (`.env`, loaded by `dotenv`): `DATABASE_URL`, `BACKEND_CALLBACK_URL`, `INTERNAL_API_SECRET`, `GOOGLE_API_KEY`, `JINA_API_KEY`, `ENABLE_MULTI_QUERY` (default `0` — multi-query costs ~6s/extra LLM call), `ENABLE_QUERY_REWRITE` (default `0` — rewrites context-dependent follow-ups into a self-contained query for retrieval only; ~1 extra LLM call per follow-up), `DB_POOL_MAX` (default 20), `ENABLE_PERF_LOG` (default `1`), `TEMP_DIR` (default `temp`). Never commit `.env`.
 
 ## Testing & QA
 

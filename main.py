@@ -17,22 +17,24 @@ from app.services.ingestion import (
     delete_document,
     update_document_visibility,
 )
-from app.services.retrieval import retrieve_documents
 from app.services.router import route_chat_request
 from app.services.generation import generate_rag_response
 from app.pipeline.dependencies import initialize_bm25
 from app.core.performance import start_trace
 
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timezone
+
+class ChatHistoryItem(BaseModel):
+    """Một lượt hội thoại trước đó (multi-turn memory, P0)."""
+    role: str  # "user" | "assistant" (bất kỳ giá trị khác -> assistant)
+    content: str
 
 class ChatRequest(BaseModel):
     query: str
     user_id: str
     document_id: Optional[str] = None
-
-class QueryRequest(BaseModel):
-    query: str
+    history: List[ChatHistoryItem] = []
 
 class ProcessRequest(BaseModel):
     document_id: str
@@ -175,38 +177,19 @@ def delete_document_endpoint(document_id: str):
     result = delete_document(document_id)
     return JSONResponse(content=result, status_code=200)
 
-@app.post("/api/v1/chat/retrieve")
-def retrieve_chat(request: QueryRequest):
-    """
-    Endpoint to retrieve relevant documents using Hybrid Search (BM25 + Dense)
-    and Multi-Query generation.
-    """
-    # S3: sync `def` handler -> FastAPI chạy trong threadpool, không chặn event loop.
-    trace = start_trace("retrieve", query=request.query)
-    try:
-        result = retrieve_documents(request.query)
-        result["timing"] = trace.as_dict()
-        return JSONResponse(content=result, status_code=200)
-    except ValueError as ve:
-        # E.g., when BM25 is empty because no docs are indexed yet
-        return JSONResponse(status_code=400, content={"status": "error", "message": str(ve)})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": f"Retrieval failed: {str(e)}"})
-    finally:
-        trace.emit(query=request.query)
-
 @app.post("/api/v1/chat")
 def chat_router(request: ChatRequest):
     """
-    Intelligent routing endpoint.
-    Uses LLM to route between:
-    - Summary fetch (if query asks for summary)
-    - Full RAG retrieval (if query asks about content)
+    Intent routing endpoint (deterministic, no LLM): SMALLTALK -> SUMMARY -> QA.
+    - Smalltalk (greetings/thanks): canned reply, no retrieval.
+    - Summary (explicit summary request on a selected doc): precomputed summary.
+    - QA (default): hybrid retrieval + Gemini generation with [N] citations.
     """
     # S3: sync `def` handler -> FastAPI chạy trong threadpool, không chặn event loop.
     trace = start_trace("chat", user_id=request.user_id, document_id=request.document_id)
     try:
-        result = route_chat_request(request.query, request.user_id, request.document_id)
+        history_dicts = [h.model_dump() for h in request.history]
+        result = route_chat_request(request.query, request.user_id, request.document_id, history=history_dicts)
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         if result.get("type") == "error":
@@ -216,6 +199,19 @@ def chat_router(request: ChatRequest):
                     "success": False,
                     "message": result.get("message", "Error"),
                     "data": {},
+                    "timestamp": timestamp
+                }
+            )
+        elif result.get("type") == "smalltalk":
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "Answer generated successfully",
+                    "data": {
+                        "llm_response": result.get("content", ""),
+                        "debug": {"timing": trace.as_dict()}
+                    },
                     "timestamp": timestamp
                 }
             )
@@ -235,7 +231,19 @@ def chat_router(request: ChatRequest):
         else:  # type == "qa"
             retrieval_data = result.get("retrieval_data", {})
             documents = retrieval_data.get("documents", [])
-            llm_answer = generate_rag_response(request.query, documents)
+            if not documents:
+                # P1: retrieval không tìm thấy đoạn liên quan -> KHÔNG gọi LLM trên
+                # context rỗng (tránh hallucination + tiết kiệm 1 LLM call).
+                llm_answer = (
+                    "Không tìm thấy thông tin liên quan trong tài liệu "
+                    "để trả lời câu hỏi này."
+                )
+            else:
+                llm_answer = generate_rag_response(
+                    request.query,
+                    documents,
+                    history_dicts,
+                )
             return JSONResponse(
                 status_code=200,
                 content={

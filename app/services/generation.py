@@ -6,22 +6,32 @@ from langchain_core.prompts import PromptTemplate
 
 logger = logging.getLogger(__name__)
 
-def generate_rag_response(query: str, documents: List[Dict]) -> str:
+def generate_rag_response(query: str, documents: List[Dict], history: List[Dict] = None) -> str:
     """
     Generates a final answer using the retrieved documents as context.
+
+    `history` (multi-turn memory, P0) — prior turns of the same chat session —
+    is injected into the prompt so the model can resolve references in follow-up
+    questions (pronouns, "that", "as you mentioned"). It is strictly auxiliary:
+    the answer must still be grounded in the retrieved context and cite [N] from
+    it, never from history.
     """
     try:
         # Build the LLM context. Each retrieved snippet is labelled with a stable
         # numeric citation [N] (1-based) so the model can reference its sources with a
         # compact marker that maps 1:1 to the citation list returned to the client.
         # The retrieval layer prepends a verbose "[Title: ..., Document ID: ...]\n" tag
-        # to each content blob; drop it here and relabel the snippet with [N]. The order
+        # to each content blob; drop it and relabel the snippet with [N]. The order
         # of `documents` is identical to debug.documents, so [N] <-> citations[N-1].
         context_parts = []
         for idx, doc in enumerate(documents, start=1):
             content = doc.get("content", "")
             context_parts.append("[{}]\n{}".format(idx, _strip_citation_prefix(content)))
         context_text = "\n\n---\n\n".join(context_parts)
+
+        # Conversation history block (empty string when there is no history).
+        conversation_block = _format_history(history)
+
         # Define the System Prompt via PromptTemplate. The model must emit only the
         # compact numeric source tags [N] that prefix each snippet.
         system_template = """You are an intelligent AI assistant. Your task is to answer the question based on the provided context documents.
@@ -32,7 +42,9 @@ MANDATORY REQUIREMENTS:
 3. Whenever you state information drawn from the context, append the corresponding source tag(s) at the end of that sentence or paragraph, e.g. "... [1]" or "... [1][2]". You may group several sources together.
 4. Use ONLY the numbers that actually label a snippet. Never invent, guess, or omit a number, and never output verbose citations such as titles, file names, or document IDs.
 5. Absolutely do not fabricate information. If the context does not contain enough information to answer the question, clearly state that there is no information in the documents.
+6. A "Conversation so far" section may appear below. Use it ONLY to understand references in the current question (pronouns, "that", "as you mentioned", etc.). Your answer MUST still be grounded in the Context snippets and cite [N] from them — never answer from history alone, and never treat prior turns as a citable source.
 
+{conversation_block}
 Context:
 {context}
 
@@ -42,7 +54,7 @@ Question:
 Answer:"""
 
         prompt = PromptTemplate.from_template(system_template)
-        
+
         # S2: shared singleton LLM
         chain = prompt | llm
 
@@ -50,14 +62,39 @@ Answer:"""
         with stage("generation"):
             response = chain.invoke({
                 "context": context_text,
-                "query": query
+                "query": query,
+                "conversation_block": conversation_block
             })
-        
+
         return response.content.strip()
 
     except Exception as e:
         logger.error(f"Error during RAG response generation: {e}")
         return "An error occurred while generating the answer. Please try again later."
+
+
+def _format_history(history) -> str:
+    """Renders prior turns as a "Conversation so far:" block, or "" when absent.
+    Caps to the last 10 turns to bound token usage / latency. Accepts a list of
+    dicts ({role, content}) — matching the wire shape sent by the backend."""
+    if not history:
+        return ""
+    turns = list(history)[-10:]
+    lines = []
+    for turn in turns:
+        if isinstance(turn, dict):
+            role = turn.get("role", "")
+            content = turn.get("content", "")
+        else:
+            role = getattr(turn, "role", "")
+            content = getattr(turn, "content", "")
+        label = "User" if str(role).lower() in ("user", "human") else "Assistant"
+        content = (content or "").strip()
+        if content:
+            lines.append(f"{label}: {content}")
+    if not lines:
+        return ""
+    return "Conversation so far:\n" + "\n".join(lines) + "\n"
 
 
 def _strip_citation_prefix(content: str) -> str:
