@@ -103,6 +103,7 @@ class PostgresVectorStore(VectorStore):
                         doc_id,
                         chunk_index,
                         doc.page_content,
+                        None,  # embedding: NULL until embed_pending_chunks fills it (index phase)
                         json.dumps(metadata),
                         page_number,
                     ))
