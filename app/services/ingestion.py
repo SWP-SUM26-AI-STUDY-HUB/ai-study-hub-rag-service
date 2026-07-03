@@ -30,13 +30,19 @@ def generate_document_summary(docs: List[Document]) -> str:
         if not full_text.strip():
             return "No content available to summarize."
 
+        # Language rule: gemini-2.5-flash-lite unreliably follows a "detect-then-write"
+        # instruction and would drift to French/Spanish/Portuguese on English lab docs
+        # (and leak the detected language into the output). A direct "same language,
+        # do not translate" constraint is stable across EN/VI/FR test docs.
         prompt = (
-            "You are a professional study assistant.\n"
-            "First, analyze the document content below to identify its primary language.\n"
-            "Then, generate a concise summary (around 2-3 paragraphs) of the main points of the document. "
-            "The summary must be written in the identified primary language of the document.\n"
+            "You are a professional study assistant. You will summarize a document.\n\n"
+            "CRITICAL LANGUAGE RULE: Write the summary in the SAME language that the document "
+            "content is written in. Do NOT translate the summary into any other language under "
+            "any circumstance. (For example, if the document is in English, the summary MUST be "
+            "in English; if it is in Vietnamese, the summary MUST be in Vietnamese.)\n\n"
+            "Generate a concise summary (around 2-3 paragraphs) of the main points of the document. "
             "Format the summary with a clear structure using Markdown.\n"
-            "Return only the final summary. Do not include any language labels, preamble, or metadata in the response.\n\n"
+            "Return ONLY the final summary. Do not include any language labels, preamble, or metadata in your response.\n\n"
             f"Document Content:\n{full_text[:20000]}"
         )
         
