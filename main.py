@@ -19,6 +19,7 @@ from app.services.ingestion import (
 )
 from app.services.router import route_chat_request
 from app.services.generation import generate_rag_response
+from app.services.guardrail import check_chat_request
 from app.pipeline.dependencies import initialize_bm25
 from app.core.performance import start_trace
 
@@ -189,6 +190,26 @@ def chat_router(request: ChatRequest):
     trace = start_trace("chat", user_id=request.user_id, document_id=request.document_id)
     try:
         history_dicts = [h.model_dump() for h in request.history]
+        gr = check_chat_request(request.query, history_dicts)
+        if not gr.allowed:
+            # Guardrail block -> HTTP 200 với lời từ chối chuẩn (giống pattern
+            # smalltalk/empty-retrieval). KHÔNG gọi retrieval/generation.
+            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "Answer generated successfully",
+                    "data": {
+                        "llm_response": gr.refusal,
+                        "debug": {
+                            "guardrail": {"category": gr.category, "reason": gr.reason},
+                            "timing": trace.as_dict(),
+                        },
+                    },
+                    "timestamp": timestamp,
+                },
+            )
         result = route_chat_request(request.query, request.user_id, request.document_id, history=history_dicts)
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 

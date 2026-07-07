@@ -13,15 +13,21 @@ Single FastAPI app (`main.py`) exposing REST endpoints. There is no DB ORM layer
 ```
 Java backend ──HTTP──▶ FastAPI (main.py)
                           │
-   ingest endpoints       │           chat endpoints
-   POST /chat  ─▶ router (deterministic: SMALLTALK → SUMMARY → QA)
-   POST /rag/extract      │                              │
-   POST /rag/index        │              QA branch: retrieve_documents()
-   PATCH /rag/.../visibility│              ├─ BM25 (parent docs, filtered by document_id)
-   DELETE /rag/documents/{id}│             ├─ dense pgvector cosine (HNSW, k=25)
-                          │              ├─ EnsembleRetriever (BM25 0.3 / dense 0.7)
-   ◀── callback (X-Internal-Secret) ─     ├─ Jina re-rank → top context
-        send_callback() ──▶ backend       └─ Gemini generation (+ conversation history) → [N] citations
+   ingest endpoints       │           chat endpoint: POST /api/v1/chat
+   POST /rag/extract      │           │
+   POST /rag/index        │           ├─ guardrail (runs BEFORE router, in main.chat_router):
+   PATCH /rag/.../visibility│         │     • validate_input + detect_prompt_injection (always ON)
+   DELETE /rag/documents/{id}│        │     • check_policy_topic (LLM) only if ENABLE_POLICY_GUARDRAIL=1
+                          │           │     • block ─▶ HTTP 200 canned refusal (no retrieval/generation)
+                          │           ▼
+                          └─▶ route_chat_request (deterministic: SMALLTALK → SUMMARY → QA)
+                                        QA branch: retrieve_documents()
+                                        ├─ BM25 (parent docs, filtered by document_id)
+                                        ├─ dense pgvector cosine (HNSW, k=25)
+                                        ├─ EnsembleRetriever (BM25 0.3 / dense 0.7)
+                                        ├─ Jina re-rank → top context
+                                        └─ Gemini generation (+ history) → [N] citations
+   ◀── callback (X-Internal-Secret) ─ send_callback() ──▶ backend
 ```
 
 **Ingestion is two-phase** (`app/services/ingestion.py`):
@@ -48,6 +54,7 @@ app/
 ├── services/
 │   ├── ingestion.py        _extract / _index / process / extract / index tasks + delete + visibility
 │   ├── retrieval.py        Hybrid retrieval (BM25+dense) + Jina re-rank; optional follow-up query-rewrite
+│   ├── guardrail.py       /chat input guardrail: validate_input + detect_prompt_injection (always ON) + check_policy_topic (LLM, ENABLE_POLICY_GUARDRAIL); block → HTTP 200 canned refusal
 │   ├── router.py           Deterministic router (regex): SMALLTALK / SUMMARY / QA — no LLM
 │   └── generation.py       Gemini RAG answer with [N] citations; consumes history (multi-turn)
 └── pipeline/
@@ -103,6 +110,8 @@ docker compose up --build -d
 
 **Intent routing (deterministic, no LLM).** `route_chat_request()` classifies each `/chat` query by regex into SMALLTALK (greetings/thanks/farewell) → SUMMARY (explicit summary request on a selected `document_id`) → QA (default). The router makes **no LLM call** — a 3-way intent split is trivially rule-based; an LLM here only added latency + a quota increment per request. `document_id == null` is always QA (SUMMARY needs a specific doc). Misses are safe: a paraphrased summary request with no keyword falls through to QA, which still answers over the selected doc.
 
+**Input guardrail (`/chat` only).** `check_chat_request()` (`app/services/guardrail.py`) runs in `main.chat_router` **before** `route_chat_request`, over `query` + `history`. Three branches, first block wins; every block returns **HTTP 200** with a canned refusal in `data.llm_response` (+ `data.debug.guardrail{category,reason}`) — no retrieval/generation: (1) `validate_input` — deterministic, always ON (empty / over-length query, control & zero-width chars except `\n`/`\t`, history >10 turns or malformed items); (2) `detect_prompt_injection` — EN+VI rule-based regex, always ON (override/extraction, role-hijack, chat-template injection), scans `query` **and** each `history` content; (3) `check_policy_topic` — LLM classifier, **OFF by default** (`ENABLE_POLICY_GUARDRAIL=1`), fail-open on any LLM/parse error → ALLOW. Refusal locale follows `query.isascii()` (ASCII→EN, else VI), matching `_smalltalk_reply`. Uploaded documents are **not** scanned here (moderated upstream at ingestion). Constants `MAX_QUERY_LENGTH=2000`, `MAX_HISTORY_TURNS=10`, `MAX_HISTORY_ITEM_LENGTH=2000` live in the module (tuning params, not env).
+
 **Multi-turn memory.** The backend sends the session's prior turns as `history` (`{role, content}`, oldest first, capped at 10) in the `/chat` body. `generate_rag_response()` injects them as a "Conversation so far" block so the model can resolve follow-up references (pronouns, "that", "as you mentioned"). History is **auxiliary only** — the answer must still be grounded in the retrieved context and cite `[N]` from it, never from history. For context-dependent follow-ups (e.g. "hãy trả lời nội dung đó"), `ENABLE_QUERY_REWRITE=1` rewrites the query into a self-contained one (1 LLM call) and feeds it to retrieval + rerank **only** — the generator still receives the original query (option b). Default OFF; triggered only when the query looks like a follow-up (pronouns/deictics) and history is present.
 
 **Empty-retrieval guard.** When the QA branch retrieves zero relevant chunks, `chat_router` short-circuits with a fixed "no information" message instead of calling the generator on an empty context (avoids hallucination + saves a generation call).
@@ -111,17 +120,18 @@ docker compose up --build -d
 
 | File | Purpose |
 |------|---------|
-| `main.py` | FastAPI app: endpoints (`/rag/process`, `/rag/extract`, `/rag/index`, `/rag/documents/{id}/visibility`, `/rag/documents/{id}`, `/chat`), request models (`ChatRequest` carries `history` for multi-turn memory), startup (BM25 init + client warmup). The old `/chat/retrieve` debug endpoint was removed (it searched the whole store unfiltered). |
+| `main.py` | FastAPI app: endpoints (`/rag/process`, `/rag/extract`, `/rag/index`, `/rag/documents/{id}/visibility`, `/rag/documents/{id}`, `/chat`), request models (`ChatRequest` carries `history` for multi-turn memory), startup (BM25 init + client warmup). `/chat` runs the input **guardrail** (`check_chat_request`) before the router; a block returns HTTP 200 with a canned refusal + `data.debug.guardrail`. The old `/chat/retrieve` debug endpoint was removed (it searched the whole store unfiltered). |
 | `app/services/ingestion.py` | Two-phase `_extract`/`_index` + `process/extract/index_document_task`, `delete_document`, `update_document_visibility`, `send_callback`, `generate_document_summary` |
 | `app/services/retrieval.py` | `retrieve_documents(query, document_ids, history=None)` — hybrid BM25+dense (`EnsembleRetriever`) + Jina rerank; BM25 pre-filtered by `document_id`; optional follow-up query-rewrite (`ENABLE_QUERY_REWRITE` — retrieval/rerank only, generator keeps the original query) |
 | `app/services/router.py` | `route_chat_request()` — deterministic regex router: SMALLTALK → SUMMARY (needs `document_id`) → QA (default); **no LLM**. Returns `smalltalk` / `summary` / `qa` / `error` |
 | `app/services/generation.py` | `generate_rag_response(query, documents, history=None)` — Gemini answer with `[N]` citation markers; injects prior turns (`history`) to resolve follow-up references |
+| `app/services/guardrail.py` | `check_chat_request(query, history)` — input guardrail run before the router: `validate_input` (deterministic) + `detect_prompt_injection` (EN+VI regex) always ON; `check_policy_topic` (Gemini classifier) opt-in via `ENABLE_POLICY_GUARDRAIL`, fail-open. Block → HTTP 200 canned refusal (locale via `query.isascii()`); returns `GuardrailResult{allowed, refusal, category, reason}` |
 | `app/database/vector_store.py` | Custom `PostgresVectorStore`: `add_texts` (embed), `add_texts_without_embedding` (extract), `embed_pending_chunks` (index), `delete_by_document_id`, `update_chunk_visibility`, `similarity_search_by_vector` (`embedding IS NOT NULL`) |
 | `app/pipeline/dependencies.py` | Pipeline singletons: `embeddings` (Gemini 1536-dim), `vectorstore`, `store` (LocalFileStore), `retriever` (ParentDocumentRetriever), splitters, BM25 `state` + `initialize_bm25`/`update_bm25` |
 | `app/database/pool.py` | `ThreadedConnectionPool` + `db_connection()` context manager |
 | `app/database/document_store.py` | `get_document_summary` / `get_document_title` / `get_user_document_ids` |
 | `app/core/clients.py` | Singleton `llm` (`gemini-2.5-flash-lite`) + `reranker` (`jina-reranker-v3`, top_n=5) |
-| `app/core/config.py` | `Settings`: `DATABASE_URL`, `BACKEND_CALLBACK_URL`, `INTERNAL_API_SECRET`, `TEMP_DIR` |
+| `app/core/config.py` | `Settings`: `DATABASE_URL`, `BACKEND_CALLBACK_URL`, `INTERNAL_API_SECRET`, `TEMP_DIR`, `ENABLE_POLICY_GUARDRAIL` (default `0`) |
 | `app/core/performance.py` | `start_trace` / `stage` / `PerformanceTrace.emit` → `logs/performance.log` (`ENABLE_PERF_LOG`) |
 | `initdb.sql` | Shared DDL: `document_chunks(id, document_id, chunk_index, content, embedding vector(1536), metadata jsonb, page_number)` + `CREATE EXTENSION vector` + HNSW `vector_cosine_ops` index |
 | `requirements.txt` | Pinned: `fastapi`, `uvicorn`, **`langchain>=0.3,<0.4` (pinned — 1.x breaks)**, `langchain-google-genai`, `psycopg2-binary`, `rank_bm25`, `pypdf`, `docx2txt`, `python-dotenv` |
@@ -133,7 +143,7 @@ The Java backend (`~/code/ai-study-hub-api`, Spring Boot 4.0.6) is the API gatew
 
 **Contract (this service's side):**
 - Receives `POST /api/v1/rag/process` (private: extract+index), `/extract` (public: extract only), `/index` (after approval: embed pending), `PATCH /rag/documents/{id}/visibility`, `DELETE /rag/documents/{id}`, `POST /api/v1/chat` — all from the backend over the shared network. (The old `/chat/retrieve` debug endpoint was removed.)
-- `/chat` body: `{query, user_id, document_id, history}` — `history` is the session's prior turns (`{role, content}`, oldest first, ≤10) for multi-turn memory. Response shape is unchanged (`data.llm_response` + `data.debug`); the router internally picks SMALLTALK (canned reply) / SUMMARY (precomputed) / QA (retrieval + generation, with an empty-retrieval guard).
+- `/chat` body: `{query, user_id, document_id, history}` — `history` is the session's prior turns (`{role, content}`, oldest first, ≤10) for multi-turn memory. The input **guardrail** (`check_chat_request`) runs first; a block returns HTTP 200 with a canned refusal in `data.llm_response` (+ `data.debug.guardrail{category,reason}`) and skips retrieval/generation. Otherwise the router internally picks SMALLTALK (canned reply) / SUMMARY (precomputed) / QA (retrieval + generation, with an empty-retrieval guard). Response shape is unchanged (`data.llm_response` + `data.debug`).
 - Sends `POST` to `${BACKEND_CALLBACK_URL}` (= backend `/api/v1/internal/documents/callback`) with `X-Internal-Secret: ${INTERNAL_API_SECRET}`, body `{document_id, status: SUCCESS|EXTRACTED|FAILED, summary}`.
 
 **Gotchas:**
@@ -141,6 +151,8 @@ The Java backend (`~/code/ai-study-hub-api`, Spring Boot 4.0.6) is the API gatew
 - **The backend reads `document_chunks` read-only** (its `DocumentChunkRepository`) for moderation — it never writes this table. Only this service writes `document_chunks`.
 - The backend gates which `document_id`s reach `/chat` (only `COMPLETED` docs), so this service does not need to filter retrieval by document status — but it does filter `embedding IS NOT NULL` as a safety net.
 - **Smalltalk/greetings** (detected in this service's router) return a canned reply with no retrieval and no citations — but the backend still counts them against the daily AI quota, because it increments the counter *before* calling RAG. If chitchat should be free, the backend must detect it itself.
+- **Guardrail blocks return HTTP 200, not an error.** A blocked `/chat` query returns `success:true` with a canned refusal in `data.llm_response` (same shape as a normal answer); the only distinguishing signal is `data.debug.guardrail{category,reason}`. The backend cannot tell a guardrail refusal from a real answer by status code — if it must (e.g. to skip the daily AI quota), inspect `data.debug.guardrail` or do its own input check. Validation + injection are always ON; the LLM policy layer is opt-in and fail-open (LLM error → ALLOW), so it never hard-blocks on its own.
+
 - See the backend's `AGENTS.md` for the full document lifecycle / moderation flow.
 
 ## Runtime / Tooling Preferences
@@ -150,7 +162,7 @@ The Java backend (`~/code/ai-study-hub-api`, Spring Boot 4.0.6) is the API gatew
 - **Dependencies**: `pip install -r requirements.txt`. **LangChain is pinned to 0.3.x — do not bump to 1.x** (it removed `langchain.storage`, reshuffled `langchain.retrievers`, etc.; this code targets the 0.3 API). ChromaDB is intentionally **not** used — vectors live in pgvector via the custom `PostgresVectorStore`.
 - **Container**: `docker-compose.yml` builds `.` and joins the **external** `ai-study-hub-network` (created by the backend's compose). Mounts `parent_docs_store/`, `temp/`, `logs/` so parent docs and logs survive restarts.
 - **External APIs**: Google Gemini (LLM `gemini-2.5-flash-lite`, embeddings `gemini-embedding-001` forced to **1536 dims**) + Jina (`jina-reranker-v3`). Keys via env (`GOOGLE_API_KEY` consumed by langchain-google-genai, `JINA_API_KEY`).
-- **Env vars** (`.env`, loaded by `dotenv`): `DATABASE_URL`, `BACKEND_CALLBACK_URL`, `INTERNAL_API_SECRET`, `GOOGLE_API_KEY`, `JINA_API_KEY`, `ENABLE_MULTI_QUERY` (default `0` — multi-query costs ~6s/extra LLM call), `ENABLE_QUERY_REWRITE` (default `0` — rewrites context-dependent follow-ups into a self-contained query for retrieval only; ~1 extra LLM call per follow-up), `DB_POOL_MAX` (default 20), `ENABLE_PERF_LOG` (default `1`), `TEMP_DIR` (default `temp`). Never commit `.env`.
+- **Env vars** (`.env`, loaded by `dotenv`): `DATABASE_URL`, `BACKEND_CALLBACK_URL`, `INTERNAL_API_SECRET`, `GOOGLE_API_KEY`, `JINA_API_KEY`, `ENABLE_MULTI_QUERY` (default `0` — multi-query costs ~6s/extra LLM call), `ENABLE_QUERY_REWRITE` (default `0` — rewrites context-dependent follow-ups into a self-contained query for retrieval only; ~1 extra LLM call per follow-up), `ENABLE_POLICY_GUARDRAIL` (default `0` — turns ON the `/chat` policy/topic LLM guardrail; the validation + injection layers are always ON regardless), `DB_POOL_MAX` (default 20), `ENABLE_PERF_LOG` (default `1`), `TEMP_DIR` (default `temp`). Never commit `.env`.
 
 ## Testing & QA
 
