@@ -19,7 +19,13 @@ from app.services.ingestion import (
 )
 from app.services.router import route_chat_request
 from app.services.generation import generate_rag_response
-from app.services.guardrail import check_chat_request
+from app.services.guardrail import check_chat_request, detect_prompt_injection
+from app.services.study_material import (
+    generate_quiz,
+    generate_flashcards,
+    QUIZ_MIN, QUIZ_MAX, QUIZ_DEFAULT,
+    FLASHCARD_MIN, FLASHCARD_MAX, FLASHCARD_DEFAULT,
+)
 from app.pipeline.dependencies import initialize_bm25
 from app.core.performance import start_trace
 
@@ -46,6 +52,11 @@ class IndexRequest(BaseModel):
 
 class VisibilityRequest(BaseModel):
     visibility: str
+
+class StudyMaterialRequest(BaseModel):
+    document_id: str
+    count: Optional[int] = None   # clamped per-type in the endpoint
+    focus: Optional[str] = None   # optional topic scope; guarded against injection
 
 app = FastAPI(
     title="RAG Ingestion Pipeline", 
@@ -283,6 +294,124 @@ def chat_router(request: ChatRequest):
         return JSONResponse(status_code=500, content={"success": False, "message": f"Router failed: {str(e)}", "data": {}, "timestamp": timestamp})
     finally:
         trace.emit(query=request.query)
+
+def _material_envelope(result, payload_key: str, trace, message_ok: str):
+    """Build the wire response for quiz/flashcard endpoints.
+
+    A refusal (refused=True) maps to HTTP 200 + success:true + empty items +
+    debug.refused (NOT an error), matching the guardrail canned-refusal pattern —
+    the backend cannot tell a refusal from a success by status code and instead
+    inspects debug.refused / item count. Genuine errors surface inside the service
+    as a refused_result, so the endpoint never returns a raw 500 for them.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if result.refused:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": result.reason,
+                "data": {
+                    payload_key: [],
+                    "debug": {"refused": True, "reason": result.reason, "timing": trace.as_dict()},
+                },
+                "timestamp": timestamp,
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "message": message_ok,
+            "data": {
+                payload_key: result.items,
+                "debug": {"refused": False, "timing": trace.as_dict()},
+            },
+            "timestamp": timestamp,
+        },
+    )
+
+
+def _check_focus_guardrail(focus: Optional[str]):
+    """Guard the optional `focus` free-text against prompt injection (regex, always ON).
+
+    No full guardrail run: quiz/flashcard generation has no user free-text `query`
+    (only document_id + count); `focus` is the only user-controlled string, and the
+    document content itself is moderated upstream at ingestion.
+    """
+    if not focus or not focus.strip():
+        return None
+    return detect_prompt_injection(focus)
+
+
+@app.post("/api/v1/quiz/generate")
+def generate_quiz_endpoint(request: StudyMaterialRequest):
+    """Generate a multiple-choice quiz from one document (Gemini, structured JSON).
+
+    Refuses (HTTP 200, empty `quiz`) when the document is too short / fragmented /
+    not indexed. `focus` optionally scopes questions to a topic (injection-guarded).
+    """
+    trace = start_trace("quiz_endpoint", document_id=request.document_id)
+    try:
+        block = _check_focus_guardrail(request.focus)
+        if block and not block.allowed:
+            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": block.refusal,
+                    "data": {
+                        "quiz": [],
+                        "debug": {
+                            "refused": True,
+                            "guardrail": {"category": block.category, "reason": block.reason},
+                            "timing": trace.as_dict(),
+                        },
+                    },
+                    "timestamp": timestamp,
+                },
+            )
+        count = request.count if request.count is not None else QUIZ_DEFAULT
+        result = generate_quiz(request.document_id, count=count, focus=request.focus)
+        return _material_envelope(result, "quiz", trace, "Quiz generated successfully")
+    finally:
+        trace.emit()
+
+
+@app.post("/api/v1/flashcard/generate")
+def generate_flashcard_endpoint(request: StudyMaterialRequest):
+    """Generate flashcards from one document (Gemini, structured JSON).
+
+    Refuses (HTTP 200, empty `flashcards`) when the document is too short /
+    fragmented / not indexed. `focus` optionally scopes cards to a topic.
+    """
+    trace = start_trace("flashcard_endpoint", document_id=request.document_id)
+    try:
+        block = _check_focus_guardrail(request.focus)
+        if block and not block.allowed:
+            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": block.refusal,
+                    "data": {
+                        "flashcards": [],
+                        "debug": {
+                            "refused": True,
+                            "guardrail": {"category": block.category, "reason": block.reason},
+                            "timing": trace.as_dict(),
+                        },
+                    },
+                    "timestamp": timestamp,
+                },
+            )
+        count = request.count if request.count is not None else FLASHCARD_DEFAULT
+        result = generate_flashcards(request.document_id, count=count, focus=request.focus)
+        return _material_envelope(result, "flashcards", trace, "Flashcards generated successfully")
+    finally:
+        trace.emit()
 
 if __name__ == "__main__":
     import uvicorn
