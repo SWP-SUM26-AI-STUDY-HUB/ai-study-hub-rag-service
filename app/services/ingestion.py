@@ -10,6 +10,7 @@ from typing import List
 from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from app.core.clients import llm
+from app.core.langfuse_client import lf_span, get_langchain_callbacks, trace_ingest
 
 from app.core.config import settings
 from app.pipeline.dependencies import retriever, vectorstore, store, update_bm25
@@ -46,7 +47,8 @@ def generate_document_summary(docs: List[Document]) -> str:
             f"Document Content:\n{full_text[:20000]}"
         )
         
-        response = llm.invoke(prompt)
+        with lf_span("document-summary"):
+            response = llm.invoke(prompt, config={"callbacks": get_langchain_callbacks()})
         return response.content
     except Exception as e:
         logger.error(f"Failed to generate summary: {e}")
@@ -153,27 +155,39 @@ def process_document_task(file_url: str, filename: str, metadata_input: dict):
     logger.info(f"Starting background processing for {filename}...")
     document_id = metadata_input.get("document_id")
     file_path = None
-    try:
-        docs, file_path = _download_and_load(file_url, filename, document_id)
-        if docs is None:
+    with trace_ingest("ingest-process", document_id, filename) as root:
+        try:
+            with lf_span("download_load"):
+                docs, file_path = _download_and_load(file_url, filename, document_id)
+            if docs is None:
+                if document_id:
+                    send_callback(document_id, "FAILED")
+                if root:
+                    root.update(output={"status": "FAILED", "reason": "unsupported_file_type"})
+                return
+            with lf_span("extract_to_store"):
+                _extract_to_store(docs, document_id)
+            # Private docs skip moderation -> index immediately.
+            with lf_span("index_embed"):
+                embedded = vectorstore.embed_pending_chunks(document_id)
+            with lf_span("bm25_rebuild"):
+                update_bm25()
+            with lf_span("summary"):
+                summary = generate_document_summary(docs) if document_id else ""
+            if document_id:
+                send_callback(document_id, "SUCCESS", summary)
+            if root:
+                root.update(output={"status": "SUCCESS", "chunks_embedded": embedded, "summary_len": len(summary)})
+        except Exception as e:
+            logger.error(f"Error processing document {filename}: {e}")
             if document_id:
                 send_callback(document_id, "FAILED")
-            return
-        _extract_to_store(docs, document_id)
-        # Private docs skip moderation -> index immediately.
-        vectorstore.embed_pending_chunks(document_id)
-        update_bm25()
-        summary = generate_document_summary(docs) if document_id else ""
-        if document_id:
-            send_callback(document_id, "SUCCESS", summary)
-    except Exception as e:
-        logger.error(f"Error processing document {filename}: {e}")
-        if document_id:
-            send_callback(document_id, "FAILED")
-    finally:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Cleaned up temporary file: {file_path}")
+            if root:
+                root.update(output={"status": "FAILED", "error": str(e)[:200]})
+        finally:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Cleaned up temporary file: {file_path}")
 
 
 def extract_document_task(file_url: str, filename: str, metadata_input: dict):
@@ -187,25 +201,35 @@ def extract_document_task(file_url: str, filename: str, metadata_input: dict):
     logger.info(f"Starting background EXTRACTION (public) for {filename}...")
     document_id = metadata_input.get("document_id")
     file_path = None
-    try:
-        docs, file_path = _download_and_load(file_url, filename, document_id)
-        if docs is None:
+    with trace_ingest("ingest-extract", document_id, filename) as root:
+        try:
+            with lf_span("download_load"):
+                docs, file_path = _download_and_load(file_url, filename, document_id)
+            if docs is None:
+                if document_id:
+                    send_callback(document_id, "FAILED")
+                if root:
+                    root.update(output={"status": "FAILED", "reason": "unsupported_file_type"})
+                return
+            with lf_span("extract_to_store"):
+                _extract_to_store(docs, document_id)
+            # NO embedding, NO BM25 rebuild — wait for moderation + approval.
+            with lf_span("summary"):
+                summary = generate_document_summary(docs) if document_id else ""
+            if document_id:
+                send_callback(document_id, "EXTRACTED", summary)
+            if root:
+                root.update(output={"status": "EXTRACTED", "summary_len": len(summary)})
+        except Exception as e:
+            logger.error(f"Error extracting document {filename}: {e}")
             if document_id:
                 send_callback(document_id, "FAILED")
-            return
-        _extract_to_store(docs, document_id)
-        # NO embedding, NO BM25 rebuild — wait for moderation + approval.
-        summary = generate_document_summary(docs) if document_id else ""
-        if document_id:
-            send_callback(document_id, "EXTRACTED", summary)
-    except Exception as e:
-        logger.error(f"Error extracting document {filename}: {e}")
-        if document_id:
-            send_callback(document_id, "FAILED")
-    finally:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Cleaned up temporary file: {file_path}")
+            if root:
+                root.update(output={"status": "FAILED", "error": str(e)[:200]})
+        finally:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Cleaned up temporary file: {file_path}")
 
 
 def index_document_task(document_id: str):
@@ -216,14 +240,21 @@ def index_document_task(document_id: str):
     summary — already stored at extract time).
     """
     logger.info(f"Indexing document {document_id}...")
-    try:
-        count = vectorstore.embed_pending_chunks(document_id)
-        update_bm25()
-        logger.info(f"Indexed {count} chunk(s) for document {document_id}.")
-        send_callback(document_id, "SUCCESS")
-    except Exception as e:
-        logger.error(f"Error indexing document {document_id}: {e}")
-        send_callback(document_id, "FAILED")
+    with trace_ingest("ingest-index", document_id) as root:
+        try:
+            with lf_span("index_embed"):
+                count = vectorstore.embed_pending_chunks(document_id)
+            with lf_span("bm25_rebuild"):
+                update_bm25()
+            logger.info(f"Indexed {count} chunk(s) for document {document_id}.")
+            send_callback(document_id, "SUCCESS")
+            if root:
+                root.update(output={"status": "SUCCESS", "chunks_embedded": count})
+        except Exception as e:
+            logger.error(f"Error indexing document {document_id}: {e}")
+            send_callback(document_id, "FAILED")
+            if root:
+                root.update(output={"status": "FAILED", "error": str(e)[:200]})
 
 
 def delete_document(document_id: str) -> dict:

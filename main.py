@@ -29,7 +29,7 @@ from app.services.study_material import (
 )
 from app.pipeline.dependencies import initialize_bm25
 from app.core.performance import start_trace
-from app.core.langfuse_client import trace_chat
+from app.core.langfuse_client import trace_chat, trace_material
 
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -219,6 +219,30 @@ def _lf_record(root, *, route: str, answer: str = None, retrieved_count: int = 0
     except Exception:
         pass  # tracing không được làm sập request
 
+def _lf_record_material(root, *, kind: str, result=None, refused: bool = False,
+                        refusal_category: str = None, generated: int = 0, error: str = None):
+    """Ghi metadata cho quiz/flashcard trace. No-op nếu root None (fail-open).
+
+    `kind` ∈ {quiz, flashcard}. `result` (GenerationResult) nếu có -> tự lấy refused/items.
+    """
+    if not root:
+        return
+    try:
+        if result is not None:
+            refused = result.refused
+            generated = len(result.items)
+            error = result.reason if result.refused else None
+        meta = {"route": kind, "refused": refused}
+        if generated:
+            meta["generated"] = generated
+        if refusal_category:
+            meta["refusal_category"] = refusal_category
+        if error:
+            meta["error"] = error[:200]
+        root.update(metadata=meta)
+    except Exception:
+        pass  # tracing không được làm sập request
+
 @app.post("/api/v1/chat")
 def chat_router(request: ChatRequest):
     """
@@ -390,31 +414,34 @@ def generate_quiz_endpoint(request: StudyMaterialRequest):
     not indexed. `focus` optionally scopes questions to a topic (injection-guarded).
     """
     trace = start_trace("quiz_endpoint", document_id=request.document_id)
-    try:
-        block = _check_focus_guardrail(request.focus)
-        if block and not block.allowed:
-            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "message": block.refusal,
-                    "data": {
-                        "quiz": [],
-                        "debug": {
-                            "refused": True,
-                            "guardrail": {"category": block.category, "reason": block.reason},
-                            "timing": trace.as_dict(),
+    count = request.count if request.count is not None else QUIZ_DEFAULT
+    with trace_material("quiz", request.document_id, count=count, focus=request.focus or "") as lf_root:
+        try:
+            block = _check_focus_guardrail(request.focus)
+            if block and not block.allowed:
+                _lf_record_material(lf_root, kind="quiz", refused=True, refusal_category=block.category)
+                timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "success": True,
+                        "message": block.refusal,
+                        "data": {
+                            "quiz": [],
+                            "debug": {
+                                "refused": True,
+                                "guardrail": {"category": block.category, "reason": block.reason},
+                                "timing": trace.as_dict(),
+                            },
                         },
+                        "timestamp": timestamp,
                     },
-                    "timestamp": timestamp,
-                },
-            )
-        count = request.count if request.count is not None else QUIZ_DEFAULT
-        result = generate_quiz(request.document_id, count=count, focus=request.focus)
-        return _material_envelope(result, "quiz", trace, "Quiz generated successfully")
-    finally:
-        trace.emit()
+                )
+            result = generate_quiz(request.document_id, count=count, focus=request.focus)
+            _lf_record_material(lf_root, kind="quiz", result=result)
+            return _material_envelope(result, "quiz", trace, "Quiz generated successfully")
+        finally:
+            trace.emit()
 
 
 @app.post("/api/v1/flashcard/generate")
@@ -425,31 +452,34 @@ def generate_flashcard_endpoint(request: StudyMaterialRequest):
     fragmented / not indexed. `focus` optionally scopes cards to a topic.
     """
     trace = start_trace("flashcard_endpoint", document_id=request.document_id)
-    try:
-        block = _check_focus_guardrail(request.focus)
-        if block and not block.allowed:
-            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "message": block.refusal,
-                    "data": {
-                        "flashcards": [],
-                        "debug": {
-                            "refused": True,
-                            "guardrail": {"category": block.category, "reason": block.reason},
-                            "timing": trace.as_dict(),
+    count = request.count if request.count is not None else FLASHCARD_DEFAULT
+    with trace_material("flashcard", request.document_id, count=count, focus=request.focus or "") as lf_root:
+        try:
+            block = _check_focus_guardrail(request.focus)
+            if block and not block.allowed:
+                _lf_record_material(lf_root, kind="flashcard", refused=True, refusal_category=block.category)
+                timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "success": True,
+                        "message": block.refusal,
+                        "data": {
+                            "flashcards": [],
+                            "debug": {
+                                "refused": True,
+                                "guardrail": {"category": block.category, "reason": block.reason},
+                                "timing": trace.as_dict(),
+                            },
                         },
+                        "timestamp": timestamp,
                     },
-                    "timestamp": timestamp,
-                },
-            )
-        count = request.count if request.count is not None else FLASHCARD_DEFAULT
-        result = generate_flashcards(request.document_id, count=count, focus=request.focus)
-        return _material_envelope(result, "flashcards", trace, "Flashcards generated successfully")
-    finally:
-        trace.emit()
+                )
+            result = generate_flashcards(request.document_id, count=count, focus=request.focus)
+            _lf_record_material(lf_root, kind="flashcard", result=result)
+            return _material_envelope(result, "flashcards", trace, "Flashcards generated successfully")
+        finally:
+            trace.emit()
 
 if __name__ == "__main__":
     import uvicorn

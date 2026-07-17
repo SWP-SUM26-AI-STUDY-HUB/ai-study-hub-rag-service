@@ -30,6 +30,8 @@ from pydantic import BaseModel, Field
 from app.core.clients import llm
 # Instrumentation: per-stage timing -> logs/performance.log.
 from app.core.performance import stage, start_trace
+from app.core.langfuse_client import lf_span, get_langchain_callbacks
+from langfuse import observe
 from app.database.document_store import get_document_content
 
 logger = logging.getLogger(__name__)
@@ -174,11 +176,12 @@ def _validate_flashcard(items: List[FlashcardItem], count: int) -> List[dict]:
     return out
 
 
+@observe(name="quiz-generation")
 def generate_quiz(document_id: str, count: int = QUIZ_DEFAULT, focus: Optional[str] = None) -> GenerationResult:
     """Generate a quiz from a document. See module docstring for the refusal model."""
     trace = start_trace("quiz_generate", document_id=document_id, count=count)
     try:
-        with stage("content_fetch"):
+        with stage("content_fetch"), lf_span("content_fetch"):
             content = get_document_content(document_id, MAX_CONTENT_CHARS)
         if not content:
             return GenerationResult.refused_result(
@@ -193,7 +196,7 @@ def generate_quiz(document_id: str, count: int = QUIZ_DEFAULT, focus: Optional[s
         prompt = _build_prompt(_QUIZ_PROMPT, content, clamped, focus)
         structured_llm = llm.with_structured_output(QuizOutput)
 
-        with stage("generation"):
+        with stage("generation"), lf_span("generation"):
             result = _invoke_with_retry(structured_llm, prompt)
 
         if not result.suitable:
@@ -212,11 +215,12 @@ def generate_quiz(document_id: str, count: int = QUIZ_DEFAULT, focus: Optional[s
         trace.emit()
 
 
+@observe(name="flashcard-generation")
 def generate_flashcards(document_id: str, count: int = FLASHCARD_DEFAULT, focus: Optional[str] = None) -> GenerationResult:
     """Generate flashcards from a document. See module docstring for the refusal model."""
     trace = start_trace("flashcard_generate", document_id=document_id, count=count)
     try:
-        with stage("content_fetch"):
+        with stage("content_fetch"), lf_span("content_fetch"):
             content = get_document_content(document_id, MAX_CONTENT_CHARS)
         if not content:
             return GenerationResult.refused_result(
@@ -231,7 +235,7 @@ def generate_flashcards(document_id: str, count: int = FLASHCARD_DEFAULT, focus:
         prompt = _build_prompt(_FLASHCARD_PROMPT, content, clamped, focus)
         structured_llm = llm.with_structured_output(FlashcardOutput)
 
-        with stage("generation"):
+        with stage("generation"), lf_span("generation"):
             result = _invoke_with_retry(structured_llm, prompt)
 
         if not result.suitable:
@@ -260,7 +264,7 @@ def _invoke_with_retry(structured_llm, prompt: str, max_attempts: int = 2):
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return structured_llm.invoke(prompt)
+            return structured_llm.invoke(prompt, config={"callbacks": get_langchain_callbacks()})
         except Exception as e:
             last_err = e
             logger.warning("Structured-output attempt %d failed: %s", attempt, e)

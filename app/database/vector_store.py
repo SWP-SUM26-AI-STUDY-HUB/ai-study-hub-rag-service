@@ -10,6 +10,7 @@ from langchain_core.vectorstores import VectorStore
 from app.database.pool import db_connection
 # Instrumentation: đo từng giai đoạn dense search.
 from app.core.performance import stage
+from app.core.langfuse_client import lf_span
 
 
 class PostgresVectorStore(VectorStore):
@@ -137,7 +138,8 @@ class PostgresVectorStore(VectorStore):
                 if not pending:
                     return 0
                 contents = [row[1] for row in pending]
-                embeddings = self.embedding_function.embed_documents(contents)
+                with lf_span("embed_documents"):
+                    embeddings = self.embedding_function.embed_documents(contents)
                 for (chunk_id, _content), emb in zip(pending, embeddings):
                     emb_str = "[" + ",".join(map(str, emb)) + "]"
                     cur.execute(

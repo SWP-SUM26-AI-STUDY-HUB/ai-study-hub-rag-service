@@ -135,3 +135,64 @@ def trace_chat(query: str, user_id: str = "", document_id: str = ""):
     except Exception as e:  # noqa: BLE001
         logger.warning("Langfuse: trace_chat failed (%s) -> no-op.", e)
         yield None
+
+@contextmanager
+def trace_material(kind: str, document_id: str = "", count: int = None, focus: str = ""):
+    """Mở root trace cho /quiz/generate hoặc /flashcard/generate.
+
+    `kind` ∈ {"quiz", "flashcard"}. Giống trace_chat nhưng cho study-material path.
+    Service function (generate_quiz/generate_flashcards) được @observe -> tự thành
+    child observation của root này.
+    """
+    client = get_langfuse()
+    if not client:
+        yield None
+        return
+    try:
+        from langfuse import propagate_attributes
+        with client.start_as_current_observation(as_type="span", name=kind) as root:
+            with propagate_attributes(
+                trace_name=kind,
+                session_id=document_id or None,
+                tags=[kind],
+            ):
+                meta = {"document_id": document_id}
+                if count is not None:
+                    meta["count_requested"] = count
+                if focus:
+                    meta["focus"] = focus[:200]
+                root.update(metadata=meta)
+                yield root
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Langfuse: trace_material failed (%s) -> no-op.", e)
+        yield None
+
+
+@contextmanager
+def trace_ingest(task_name: str, document_id: str = "", filename: str = "", **meta):
+    """Mở root trace cho ingestion BackgroundTask (process/extract/index).
+
+    BackgroundTask chạy SAU khi HTTP response trả về, trong thread riêng -> mất
+    context của request. Helper này mở FRESH root trace (không inherit request),
+    set trace attributes (document_id/filename/tags=ingestion). Yield root span.
+    Caller wrap sub-stages bằng lf_span + update output status (SUCCESS/FAILED/EXTRACTED).
+    """
+    client = get_langfuse()
+    if not client:
+        yield None
+        return
+    try:
+        from langfuse import propagate_attributes
+        with client.start_as_current_observation(as_type="span", name=task_name) as root:
+            with propagate_attributes(
+                trace_name=task_name,
+                session_id=document_id or None,
+                tags=["ingestion"],
+            ):
+                m = {"document_id": document_id, "filename": filename}
+                m.update(meta)
+                root.update(metadata=m)
+                yield root
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Langfuse: trace_ingest failed (%s) -> no-op.", e)
+        yield None
