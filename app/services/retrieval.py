@@ -11,8 +11,9 @@ from langchain_core.prompts import PromptTemplate
 
 # S2: dùng singleton LLM/reranker thay vì new mỗi request.
 from app.core.clients import llm, reranker
-# Instrumentation: đo từng giai đoạn của funnel.
 from app.core.performance import stage
+from app.core.langfuse_client import lf_span, get_langchain_callbacks
+from langfuse import observe
 from app.database.document_store import get_document_title
 from app.pipeline.dependencies import retriever, state
 
@@ -112,7 +113,7 @@ def _rewrite_query(query: str, history) -> str:
     try:
         chain = PromptTemplate.from_template(_REWRITE_TEMPLATE) | llm
         with stage("query_rewrite"):
-            resp = chain.invoke({"question": query, "history": history_text})
+            resp = chain.invoke({"question": query, "history": history_text}, config={"callbacks": get_langchain_callbacks()})
         rewritten = (getattr(resp, "content", "") or "").strip().strip("\"'").strip()
         return rewritten or query
     except Exception as e:
@@ -158,6 +159,7 @@ class CapturingMultiQueryRetriever(MultiQueryRetriever):
         return queries
 
 
+@observe(name="retrieval-funnel", capture_input=False)
 def retrieve_documents(query: str, document_ids: List[str] = None, history=None):
     """
     Thực thi pipeline truy vấn: Hybrid Search (BM25 + Dense) + Cross-Encoder
@@ -181,7 +183,7 @@ def retrieve_documents(query: str, document_ids: List[str] = None, history=None)
             logger.info("Retrieval: query rewritten for context: '%s' -> '%s'", query, retrieval_query)
 
     # --- S6: BM25 pre-filter theo document_ids (chặn leakage ngay nguồn) ---
-    with stage("bm25_build"):
+    with stage("bm25_build"), lf_span("bm25_build"):
         bm25_retriever = _build_filtered_bm25(document_ids)
 
     # Dense retriever (ParentDocumentRetriever) lọc ở tầng SQL.
@@ -203,20 +205,20 @@ def retrieve_documents(query: str, document_ids: List[str] = None, history=None)
             retriever=ensemble_retriever,
             llm=llm
         )
-        with stage("multi_query_search"):
+        with stage("multi_query_search"), lf_span("multi_query_search"):
             # generate_queries (1 LLM, bị capture) -> lặp sub-query qua Ensemble
             # (embed + SQL + BM25 + docstore).
             candidates = mq_retriever.invoke(retrieval_query)
         generated_queries = list(mq_retriever.captured_queries)
     else:
         logger.info("Retrieval: Multi-Query OFF -> single hybrid search + rerank")
-        with stage("hybrid_search"):
+        with stage("hybrid_search"), lf_span("hybrid_search"):
             # 1 embed_query + 1 dense_sql (+ BM25) — không tốn LLM sinh sub-query.
             candidates = ensemble_retriever.invoke(retrieval_query)
         generated_queries = [retrieval_query]
 
     # --- C. Cross-Encoder Re-ranking (tách riêng để đo, dùng singleton S2) ---
-    with stage("rerank"):
+    with stage("rerank"), lf_span("rerank"):
         retrieved_docs = reranker.compress_documents(candidates, retrieval_query)
 
     # S6: BM25 đã pre-filter + dense filter ở SQL -> KHÔNG còn post-filter.

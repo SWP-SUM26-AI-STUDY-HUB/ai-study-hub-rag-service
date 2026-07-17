@@ -2,10 +2,13 @@ import logging
 from typing import List, Dict
 from app.core.clients import llm
 from app.core.performance import stage
+from app.core.langfuse_client import get_langchain_callbacks
+from langfuse import observe
 from langchain_core.prompts import PromptTemplate
 
 logger = logging.getLogger(__name__)
 
+@observe(name="rag-generation", as_type="span")
 def generate_rag_response(query: str, documents: List[Dict], history: List[Dict] = None) -> str:
     """
     Generates a final answer using the retrieved documents as context.
@@ -64,7 +67,7 @@ Answer:"""
                 "context": context_text,
                 "query": query,
                 "conversation_block": conversation_block
-            })
+            }, config={"callbacks": get_langchain_callbacks()})
 
         return response.content.strip()
 

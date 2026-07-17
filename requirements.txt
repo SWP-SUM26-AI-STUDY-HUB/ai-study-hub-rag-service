@@ -25,3 +25,9 @@ docx2txt>=0.8
 # --- Retrieval Phase Dependencies ---
 rank_bm25>=0.2.2
 python-dotenv>=1.0.0
+
+# --- LLM Observability (Langfuse SDK v4 — cần Python ≥3.10) ---
+# Self-host v3 hoặc Langfuse Cloud. Tracing /chat (Round 1): guardrail -> retrieval
+# funnel (BM25+dense+Jina rerank) -> Gemini generation. Token/cost tự có qua callback.
+# Pin <5 vì v5 chưa release ổn định; v4.7+ bật realtime Metrics API v2.
+langfuse>=4.7,<5

@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -28,6 +29,7 @@ from app.services.study_material import (
 )
 from app.pipeline.dependencies import initialize_bm25
 from app.core.performance import start_trace
+from app.core.langfuse_client import trace_chat
 
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -189,6 +191,34 @@ def delete_document_endpoint(document_id: str):
     result = delete_document(document_id)
     return JSONResponse(content=result, status_code=200)
 
+_CITATION_RE = re.compile(r"\[(\d+)\]")
+
+def _lf_record(root, *, route: str, answer: str = None, retrieved_count: int = 0,
+               refusal: str = None, empty_retrieval: bool = False, error: str = None):
+    """Ghi metadata + score lên root trace. No-op nếu root None hoặc lỗi (fail-open).
+
+    `route` ∈ {guardrail_block, smalltalk, summary, qa, error, exception}.
+    `citation_coverage` score (range 0..1) = tỷ lệ marker [N] hợp lệ (1..retrieved_count)
+    xuất hiện trong answer / số docs retrieved — chỉ chấm cho QA branch có answer + context.
+    """
+    if not root:
+        return
+    try:
+        meta = {"route": route, "empty_retrieval": empty_retrieval}
+        if retrieved_count:
+            meta["retrieved_count"] = retrieved_count
+        if refusal:
+            meta["refusal_category"] = refusal
+        if error:
+            meta["error"] = error[:200]
+        root.update(metadata=meta)
+        if route == "qa" and answer and retrieved_count > 0 and not empty_retrieval:
+            found = {int(m) for m in _CITATION_RE.findall(answer)}
+            valid = sum(1 for n in found if 1 <= n <= retrieved_count)
+            root.score(name="citation_coverage", value=round(valid / retrieved_count, 3))
+    except Exception:
+        pass  # tracing không được làm sập request
+
 @app.post("/api/v1/chat")
 def chat_router(request: ChatRequest):
     """
@@ -199,101 +229,109 @@ def chat_router(request: ChatRequest):
     """
     # S3: sync `def` handler -> FastAPI chạy trong threadpool, không chặn event loop.
     trace = start_trace("chat", user_id=request.user_id, document_id=request.document_id)
-    try:
-        history_dicts = [h.model_dump() for h in request.history]
-        gr = check_chat_request(request.query, history_dicts)
-        if not gr.allowed:
-            # Guardrail block -> HTTP 200 với lời từ chối chuẩn (giống pattern
-            # smalltalk/empty-retrieval). KHÔNG gọi retrieval/generation.
-            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "message": "Answer generated successfully",
-                    "data": {
-                        "llm_response": gr.refusal,
-                        "debug": {
-                            "guardrail": {"category": gr.category, "reason": gr.reason},
-                            "timing": trace.as_dict(),
+    with trace_chat(request.query, request.user_id, request.document_id) as lf_root:
+        try:
+            history_dicts = [h.model_dump() for h in request.history]
+            gr = check_chat_request(request.query, history_dicts)
+            if not gr.allowed:
+                # Guardrail block -> HTTP 200 với lời từ chối chuẩn (giống pattern
+                # smalltalk/empty-retrieval). KHÔNG gọi retrieval/generation.
+                _lf_record(lf_root, route="guardrail_block", refusal=gr.category)
+                timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "success": True,
+                        "message": "Answer generated successfully",
+                        "data": {
+                            "llm_response": gr.refusal,
+                            "debug": {
+                                "guardrail": {"category": gr.category, "reason": gr.reason},
+                                "timing": trace.as_dict(),
+                            },
                         },
+                        "timestamp": timestamp,
                     },
-                    "timestamp": timestamp,
-                },
-            )
-        result = route_chat_request(request.query, request.user_id, request.document_id, history=history_dicts)
-        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        if result.get("type") == "error":
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "message": result.get("message", "Error"),
-                    "data": {},
-                    "timestamp": timestamp
-                }
-            )
-        elif result.get("type") == "smalltalk":
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "message": "Answer generated successfully",
-                    "data": {
-                        "llm_response": result.get("content", ""),
-                        "debug": {"timing": trace.as_dict()}
-                    },
-                    "timestamp": timestamp
-                }
-            )
-        elif result.get("type") == "summary":
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "message": "Summary retrieved successfully",
-                    "data": {
-                        "llm_response": result.get("content", ""),
-                        "debug": {"timing": trace.as_dict()}
-                    },
-                    "timestamp": timestamp
-                }
-            )
-        else:  # type == "qa"
-            retrieval_data = result.get("retrieval_data", {})
-            documents = retrieval_data.get("documents", [])
-            if not documents:
-                # P1: retrieval không tìm thấy đoạn liên quan -> KHÔNG gọi LLM trên
-                # context rỗng (tránh hallucination + tiết kiệm 1 LLM call).
-                llm_answer = (
-                    "Không tìm thấy thông tin liên quan trong tài liệu "
-                    "để trả lời câu hỏi này."
                 )
-            else:
-                llm_answer = generate_rag_response(
-                    request.query,
-                    documents,
-                    history_dicts,
-                )
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "message": "Answer generated successfully",
-                    "data": {
-                        "llm_response": llm_answer,
-                        "debug": {**retrieval_data, "timing": trace.as_dict()},
-                    },
-                    "timestamp": timestamp
-                }
-            )
+            result = route_chat_request(request.query, request.user_id, request.document_id, history=history_dicts)
+            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    except Exception as e:
-        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        return JSONResponse(status_code=500, content={"success": False, "message": f"Router failed: {str(e)}", "data": {}, "timestamp": timestamp})
-    finally:
-        trace.emit(query=request.query)
+            if result.get("type") == "error":
+                _lf_record(lf_root, route="error", error=result.get("message"))
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "success": False,
+                        "message": result.get("message", "Error"),
+                        "data": {},
+                        "timestamp": timestamp
+                    }
+                )
+            elif result.get("type") == "smalltalk":
+                _lf_record(lf_root, route="smalltalk")
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "success": True,
+                        "message": "Answer generated successfully",
+                        "data": {
+                            "llm_response": result.get("content", ""),
+                            "debug": {"timing": trace.as_dict()}
+                        },
+                        "timestamp": timestamp
+                    }
+                )
+            elif result.get("type") == "summary":
+                _lf_record(lf_root, route="summary")
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "success": True,
+                        "message": "Summary retrieved successfully",
+                        "data": {
+                            "llm_response": result.get("content", ""),
+                            "debug": {"timing": trace.as_dict()}
+                        },
+                        "timestamp": timestamp
+                    }
+                )
+            else:  # type == "qa"
+                retrieval_data = result.get("retrieval_data", {})
+                documents = retrieval_data.get("documents", [])
+                if not documents:
+                    # P1: retrieval không tìm thấy đoạn liên quan -> KHÔNG gọi LLM trên
+                    # context rỗng (tránh hallucination + tiết kiệm 1 LLM call).
+                    llm_answer = (
+                        "Không tìm thấy thông tin liên quan trong tài liệu "
+                        "để trả lời câu hỏi này."
+                    )
+                    _lf_record(lf_root, route="qa", empty_retrieval=True)
+                else:
+                    llm_answer = generate_rag_response(
+                        request.query,
+                        documents,
+                        history_dicts,
+                    )
+                    _lf_record(lf_root, route="qa", answer=llm_answer, retrieved_count=len(documents))
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "success": True,
+                        "message": "Answer generated successfully",
+                        "data": {
+                            "llm_response": llm_answer,
+                            "debug": {**retrieval_data, "timing": trace.as_dict()},
+                        },
+                        "timestamp": timestamp
+                    }
+                )
+
+        except Exception as e:
+            _lf_record(lf_root, route="exception", error=str(e))
+            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            return JSONResponse(status_code=500, content={"success": False, "message": f"Router failed: {str(e)}", "data": {}, "timestamp": timestamp})
+        finally:
+            trace.emit(query=request.query)
 
 def _material_envelope(result, payload_key: str, trace, message_ok: str):
     """Build the wire response for quiz/flashcard endpoints.
