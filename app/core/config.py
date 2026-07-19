@@ -11,7 +11,7 @@ class Settings:
     TEMP_DIR: str = "temp"
     # Input guardrail: bật lớp Policy/Topic (LLM) cho /chat. Validation +
     # Injection (deterministic/regex) luôn ON; lớp này tốn ~1 LLM call -> OFF mặc định.
-    ENABLE_POLICY_GUARDRAIL: bool = os.getenv("ENABLE_POLICY_GUARDAIL", "0").lower() in ("1", "true", "yes", "on")
+    ENABLE_POLICY_GUARDRAIL: bool = os.getenv("ENABLE_POLICY_GUARDRAIL", "0").lower() in ("1", "true", "yes", "on")
 
     # --- LLM Observability (Langfuse) ---------------------------------------
     # Mọi instrumentation phải fail-open: nếu LANGFUSE_ENABLED=0 hoặc thiếu key,
