@@ -51,7 +51,7 @@ app/
 │   └── langfuse_client.py  Langfuse SDK v4 singleton + fail-open helpers: get_langfuse / get_langchain_callbacks
 │                           / lf_span(name) / trace_chat / trace_material / trace_ingest
 ├── database/
-│   ├── pool.py             ThreadedConnectionPool + db_connection() context manager (rollback on exit)
+│   ├── pool.py             ThreadedConnectionPool + db_connection() (rollback on exit, test-on-borrow SELECT 1, TCP keepalives)
 │   ├── vector_store.py     Custom PostgresVectorStore over pgvector (add_texts, embed_pending_chunks,
 │   │                       delete_by_document_id, update_chunk_visibility, similarity_search_by_vector)
 │   └── document_store.py   document lookups (summary, title, user document ids)
@@ -98,7 +98,7 @@ docker compose up --build -d
 
 **Singletons.** External clients (`llm`, `embeddings`, `reranker`) and pipeline objects (`vectorstore`, `store`, `retriever`, splitters, `state`) are created **once at import** in `app/core/clients.py` and `app/pipeline/dependencies.py`, then imported everywhere. Never instantiate per-request — they hold HTTP connection pools / TLS state (a former per-request `new ChatGoogleGenerativeAI(...)` cost ~50-150ms of setup each). `_warmup_clients()` at startup primes Gemini (avoids a ~14s cold-start on the first real request).
 
-**DB access.** Always borrow from the pool via the `db_connection()` context manager (`app/database/pool.py`) — it `rollback()`s in `finally` (returns the connection clean to the pool, even for reads) and is closed by `atexit`. `ThreadedConnectionPool` is used because handlers are sync `def` (see below). `minconn=1`, `maxconn=DB_POOL_MAX` (default 20).
+**DB access.** Always borrow from the pool via the `db_connection()` context manager (`app/database/pool.py`) — it `rollback()`s in `finally` (returns the connection clean to the pool, even for reads) and is closed by `atexit`. `ThreadedConnectionPool` is used because handlers are sync `def` (see below). `minconn=1`, `maxconn=DB_POOL_MAX` (default 20). Connections are opened with **TCP keepalives + a connect timeout** and validated on checkout (cheap `SELECT 1`); a connection that died idle (e.g. postgres restarted while it sat in the pool) is discarded (`putconn(close=True)`) and replaced once before yielding — so a PG restart no longer bricks this service (root cause of the 2026-07 upload-FAILED incident, where a stale pool surfaced as `server closed the connection unexpectedly` → FAILED callbacks to the Java backend). If the DB is genuinely down, the second connection surfaces the error to the caller (no infinite retry).
 
 **Sync handlers.** Endpoints use plain `def` (not `async def`) — FastAPI runs them in a threadpool, so blocking I/O (Gemini, Jina, psycopg2) does not stall the event loop. Keep new endpoints `def` unless they're genuinely async.
 
