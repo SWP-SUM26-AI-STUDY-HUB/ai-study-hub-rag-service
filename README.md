@@ -23,6 +23,8 @@ A single FastAPI app (`main.py`) exposing REST endpoints. There is no DB ORM lay
 - `PATCH /rag/documents/{id}/visibility`
 - `DELETE /rag/documents/{id}`
 - `POST /chat`: Main chat endpoint with deterministic routing (SMALLTALK → SUMMARY → QA) and input guardrails.
+- `POST /quiz/generate`: Generate structured quizzes from full document content.
+- `POST /flashcard/generate`: Generate structured flashcards from full document content.
 
 Callbacks are sent to the Java backend via HTTP POST to `BACKEND_CALLBACK_URL` using `X-Internal-Secret` for authorization.
 
@@ -58,6 +60,12 @@ Callbacks are sent to the Java backend via HTTP POST to `BACKEND_CALLBACK_URL` u
    DB_POOL_MAX=20
    ENABLE_PERF_LOG=1
    TEMP_DIR=temp
+   
+   # Langfuse Tracing (Fail-open)
+   LANGFUSE_ENABLED=1
+   LANGFUSE_PUBLIC_KEY=
+   LANGFUSE_SECRET_KEY=
+   LANGFUSE_BASE_URL=https://cloud.langfuse.com
    ```
 
 3. **Run the FastAPI server**:
@@ -79,3 +87,5 @@ Callbacks are sent to the Java backend via HTTP POST to `BACKEND_CALLBACK_URL` u
 - **Parent-Child Retrieval**: Retrieves child chunks via vector similarity, then fetches the larger parent chunk from the local file store for complete context generation.
 - **Deterministic Intent Routing**: Smalltalk and specific summary queries bypass RAG retrieval for efficiency and lower API costs.
 - **Multi-turn Memory**: Injects conversation history to resolve follow-up references for generation. Includes an optional query rewrite step for complex contextual follow-ups.
+- **Study Material Generation**: Quizzes and flashcards use full document content in reading order and Gemini's structured output (JSON mode), protected by two-layer refusals (content length floor + LLM suitability flag).
+- **Observability & Tracing**: Dual fail-open instrumentation using local performance logs and Langfuse for detailed execution traces, token usage, cost, and latency metrics without blocking the request path.
